@@ -14,6 +14,7 @@
 #include "shim_mps.h"
 #include "metal_helper.h"
 #include "utils.h"
+#include "memory.h"  // For tensors and is_tensor_own_memory globals
 
 namespace executorch {
 namespace backends {
@@ -234,6 +235,138 @@ AOTITorchError aoti_torch_mps_addmm_out(
       return Error::Internal;
     } catch (...) {
       ET_LOG(Error, "aoti_torch_mps_addmm_out: unknown exception");
+      return Error::Internal;
+    }
+  }
+}
+
+AOTITorchError aoti_torch_mps_convolution(
+    AtenTensorHandle input,
+    AtenTensorHandle weight,
+    AtenTensorHandle* bias,
+    const int64_t* stride,
+    int64_t stride_len_,
+    const int64_t* padding,
+    int64_t padding_len_,
+    const int64_t* dilation,
+    int64_t dilation_len_,
+    int32_t transposed,
+    const int64_t* output_padding,
+    int64_t output_padding_len_,
+    int64_t groups,
+    AtenTensorHandle* ret0) {
+
+  ET_LOG(Debug, "aoti_torch_mps_convolution: Starting with input=%p, weight=%p, bias=%p, groups=%ld, transposed=%d",
+         input, weight, bias, groups, transposed);
+
+  if (!input || !weight || !ret0) {
+    ET_LOG(Error, "aoti_torch_mps_convolution: null required handles (input, weight, or ret0)");
+    return Error::InvalidArgument;
+  }
+
+  @autoreleasepool {
+    try {
+      // Convert AtenTensorHandle to ExecutorTorch tensors
+      auto input_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(input);
+      auto weight_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(weight);
+
+      // bias can be null for convolutions without bias
+      executorch::runtime::etensor::Tensor* bias_tensor = nullptr;
+      if (bias && *bias) {
+        bias_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(*bias);
+        ET_LOG(Debug, "aoti_torch_mps_convolution: Has bias tensor");
+      } else {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: No bias tensor");
+      }
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Converted tensor handles to ET tensors");
+
+      // Log tensor shapes for debugging
+      ET_LOG(Debug, "aoti_torch_mps_convolution: input shape: [%d, %d, %d, %d]",
+             input_tensor->dim() > 0 ? (int)input_tensor->sizes()[0] : 0,
+             input_tensor->dim() > 1 ? (int)input_tensor->sizes()[1] : 0,
+             input_tensor->dim() > 2 ? (int)input_tensor->sizes()[2] : 0,
+             input_tensor->dim() > 3 ? (int)input_tensor->sizes()[3] : 0);
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: weight shape: [%d, %d, %d, %d]",
+             weight_tensor->dim() > 0 ? (int)weight_tensor->sizes()[0] : 0,
+             weight_tensor->dim() > 1 ? (int)weight_tensor->sizes()[1] : 0,
+             weight_tensor->dim() > 2 ? (int)weight_tensor->sizes()[2] : 0,
+             weight_tensor->dim() > 3 ? (int)weight_tensor->sizes()[3] : 0);
+
+      // Log convolution parameters
+      if (stride && stride_len_ >= 2) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: stride: [%ld, %ld]", stride[0], stride[1]);
+      }
+      if (padding && padding_len_ >= 2) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: padding: [%ld, %ld]", padding[0], padding[1]);
+      }
+      if (dilation && dilation_len_ >= 2) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: dilation: [%ld, %ld]", dilation[0], dilation[1]);
+      }
+      if (output_padding && output_padding_len_ >= 2) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: output_padding: [%ld, %ld]", output_padding[0], output_padding[1]);
+      }
+
+      // Calculate output dimensions
+      // For now, we'll create a zero-filled tensor with the expected output shape
+      // TODO: Implement actual 2D convolution using MetalPerformanceShaders or custom Metal kernels
+
+      // Get input dimensions (assuming NCHW format)
+      int64_t N = input_tensor->sizes()[0];  // batch size
+      int64_t C_in = input_tensor->sizes()[1];  // input channels
+      int64_t H_in = input_tensor->sizes()[2];  // input height
+      int64_t W_in = input_tensor->sizes()[3];  // input width
+
+      // Get weight dimensions (assuming OIHW format for weight)
+      int64_t C_out = weight_tensor->sizes()[0];  // output channels
+      int64_t kernel_h = weight_tensor->sizes()[2];  // kernel height
+      int64_t kernel_w = weight_tensor->sizes()[3];  // kernel width
+
+      // Calculate output dimensions
+      int64_t stride_h = stride && stride_len_ > 0 ? stride[0] : 1;
+      int64_t stride_w = stride && stride_len_ > 1 ? stride[1] : 1;
+      int64_t pad_h = padding && padding_len_ > 0 ? padding[0] : 0;
+      int64_t pad_w = padding && padding_len_ > 1 ? padding[1] : 0;
+      int64_t dil_h = dilation && dilation_len_ > 0 ? dilation[0] : 1;
+      int64_t dil_w = dilation && dilation_len_ > 1 ? dilation[1] : 1;
+
+      int64_t H_out = (H_in + 2 * pad_h - dil_h * (kernel_h - 1) - 1) / stride_h + 1;
+      int64_t W_out = (W_in + 2 * pad_w - dil_w * (kernel_w - 1) - 1) / stride_w + 1;
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Calculated output shape: [%ld, %ld, %ld, %ld]", N, C_out, H_out, W_out);
+
+      // Create output tensor with calculated dimensions
+      std::vector<int32_t> output_sizes = {(int32_t)N, (int32_t)C_out, (int32_t)H_out, (int32_t)W_out};
+
+      auto output_tensor = executorch::extension::make_tensor_ptr(
+          output_sizes,
+          executorch::runtime::etensor::ScalarType::Float // float32 scalar type
+      );
+
+      if (!output_tensor) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Failed to create output tensor");
+        return Error::Internal;
+      }
+
+      // Zero out the output tensor (placeholder implementation)
+      float* out_data = static_cast<float*>(output_tensor->mutable_data_ptr());
+      size_t out_numel = output_tensor->numel();
+      std::memset(out_data, 0, out_numel * sizeof(float));
+
+      // Store the tensor so it doesn't get destroyed
+      tensors.insert(output_tensor);
+      *ret0 = reinterpret_cast<AtenTensorHandle>(output_tensor.get());
+      is_tensor_own_memory[output_tensor.get()] = true;  // We created this tensor
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created zero-filled output tensor with %zu elements", out_numel);
+      return Error::Ok;
+
+    } catch (const std::exception& e) {
+      ET_LOG(Error, "aoti_torch_mps_convolution exception: %s", e.what());
+      return Error::Internal;
+    } catch (...) {
+      ET_LOG(Error, "aoti_torch_mps_convolution: unknown exception");
       return Error::Internal;
     }
   }

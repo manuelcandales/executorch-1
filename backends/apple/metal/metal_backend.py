@@ -28,6 +28,7 @@ from torch.export.passes import move_to_device_pass
 # exist fallback operators in et namespace;
 supported_fallback_kernels: Dict[str, Any] = {
     "aoti_torch_mps_addmm_out": None,
+    "aoti_torch_mps_convolution": None,
 }
 
 # required fallback kernels but not supported

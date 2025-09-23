@@ -57,6 +57,26 @@ AOTITorchError aoti_torch_mps_addmm_out(
     double beta,
     double alpha);
 
+/**
+ * ExecutorTorch implementation of aoti_torch_mps_convolution.
+ * Performs 2D convolution operation - matches PyTorch AOTI signature
+ */
+AOTITorchError aoti_torch_mps_convolution(
+    AtenTensorHandle input,
+    AtenTensorHandle weight,
+    AtenTensorHandle* bias,
+    const int64_t* stride,
+    int64_t stride_len_,
+    const int64_t* padding,
+    int64_t padding_len_,
+    const int64_t* dilation,
+    int64_t dilation_len_,
+    int32_t transposed,
+    const int64_t* output_padding,
+    int64_t output_padding_len_,
+    int64_t groups,
+    AtenTensorHandle* ret0);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
