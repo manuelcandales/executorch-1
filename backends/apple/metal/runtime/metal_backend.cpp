@@ -70,24 +70,59 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
       FreeableBuffer* processed, // This will be a empty buffer
       ArrayRef<CompileSpec> compile_specs // This will be my empty list
   ) const override {
+    ET_LOG(Info, "MetalBackend::init - Starting initialization");
+
     const NamedDataMap* named_data_map = context.get_named_data_map();
+    ET_LOG(Info, "MetalBackend::init - Got named data map: %p", named_data_map);
 
     std::string so_path = "/tmp/test.so";
     std::string so_blob_key = "so_blob";
+    ET_LOG(Info, "MetalBackend::init - Looking for blob key: %s", so_blob_key.c_str());
 
     Result<FreeableBuffer> aoti_metal_buffer =
         named_data_map->get_data(so_blob_key.c_str());
+    ET_LOG(Info, "MetalBackend::init - Got buffer result");
+
+    if (!aoti_metal_buffer.ok()) {
+      ET_LOG(Error, "MetalBackend::init - Failed to get buffer: %d", (int)aoti_metal_buffer.error());
+      return Error::InvalidArgument;
+    }
+
+    ET_LOG(Info, "MetalBackend::init - Buffer is OK, size: %zu", aoti_metal_buffer->size());
+
+    if (aoti_metal_buffer->data() == nullptr) {
+      ET_LOG(Error, "MetalBackend::init - Buffer data is null");
+      return Error::InvalidArgument;
+    }
+
+    ET_LOG(Info, "MetalBackend::init - Buffer data pointer: %p", aoti_metal_buffer->data());
 
     // Create a temporary file
+    ET_LOG(Info, "MetalBackend::init - Creating temp file: %s", so_path.c_str());
     std::ofstream outfile(so_path.c_str(), std::ios::binary);
 
+    if (!outfile.is_open()) {
+      ET_LOG(Error, "MetalBackend::init - Failed to create temp file");
+      return Error::AccessFailed;
+    }
+    ET_LOG(Info, "MetalBackend::init - Temp file created successfully");
+
     // Write the ELF buffer to the temporary file
-    outfile.write(
-        (char*)aoti_metal_buffer->data(),
-        sizeof(void*) * aoti_metal_buffer->size());
+    size_t buffer_size = aoti_metal_buffer->size();
+    ET_LOG(Info, "MetalBackend::init - About to write %zu bytes to file", buffer_size);
+
+    // Write the buffer directly, not using sizeof(void*) multiplication
+    outfile.write((char*)aoti_metal_buffer->data(), buffer_size);
+
+    if (outfile.bad()) {
+      ET_LOG(Error, "MetalBackend::init - File write failed");
+      return Error::AccessFailed;
+    }
+    ET_LOG(Info, "MetalBackend::init - Buffer written successfully");
 
     // Finish writing the file to disk
     outfile.close();
+    ET_LOG(Info, "MetalBackend::init - File closed successfully");
 
     // Load the ELF using dlopen
     void* so_handle = dlopen(so_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
@@ -152,11 +187,14 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
     }
 
     AOTInductorModelContainerHandle container_handle = nullptr;
+    ET_LOG(Info, "MetalBackend::init - About to create AOTI container with device='mps'");
 
     AOTIRuntimeError err = AOTInductorModelContainerCreateWithDevice(
         &container_handle, 1, "mps", nullptr);
+    ET_LOG(Info, "MetalBackend::init - AOTInductorModelContainerCreateWithDevice returned err=%d", err);
+
     if (err != Error::Ok) {
-      ET_LOG(Error, "Failed to initialize AOTInductorModelContainer");
+      ET_LOG(Error, "Failed to initialize AOTInductorModelContainer with error %d", err);
       return err;
     }
     ET_LOG(Info, "Successfully initialized container_handle = %p", container_handle);
