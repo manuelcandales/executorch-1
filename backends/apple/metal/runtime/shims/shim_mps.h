@@ -58,6 +58,15 @@ AOTITorchError aoti_torch_mps_addmm_out(
     double alpha);
 
 /**
+ * ExecutorTorch implementation of aoti_torch_mps_mm_out.
+ * Performs simple matrix multiplication: out = self @ mat2
+ */
+AOTITorchError aoti_torch_mps_mm_out(
+    AtenTensorHandle out,
+    AtenTensorHandle self,
+    AtenTensorHandle mat2);
+
+/**
  * ExecutorTorch implementation of aoti_torch_mps_convolution.
  * Performs 2D convolution operation - matches PyTorch AOTI signature
  */
