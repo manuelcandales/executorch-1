@@ -19,7 +19,14 @@ void metal_cleanup_resources();
 
 // Memory management functions for Metal
 bool metal_is_device_pointer(void* ptr);
+
 int metal_copy_memory(void* dst, const void* src, size_t nbytes, bool src_is_device, bool dst_is_device);
+
+#ifdef __OBJC__
+// Helper functions to access Metal objects for MPS operations (Objective-C only)
+id<MTLDevice> get_metal_device();
+id<MTLCommandQueue> get_metal_command_queue();
+#endif
 
 #ifdef __cplusplus
 }

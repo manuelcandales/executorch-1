@@ -69,25 +69,10 @@ AOTITorchError aoti_torch_mps_set_arg_tensor(
       void* data_ptr = et_tensor->mutable_data_ptr();
       ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: Retrieved data_ptr=%p", data_ptr);
 
-      if (!data_ptr) {
-        ET_LOG(Error, "aoti_torch_mps_set_arg_tensor: null data pointer");
-        return Error::InvalidArgument;
-      }
-
-      // Check if this is a Metal device pointer using our existing helper
-      bool is_metal = metal_is_device_pointer(data_ptr);
-      ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: is_metal=%d", is_metal);
-
-      if (is_metal) {
-        // This is a Metal tensor - get the MTLBuffer from our mapping
-        // Note: ptr_to_mtl_buffer is declared in metal_helper.h and defined in metal_helper.mm
-        auto it = ptr_to_mtl_buffer.find(data_ptr);
-
-        if (it == ptr_to_mtl_buffer.end()) {
-          ET_LOG(Error, "aoti_torch_mps_set_arg_tensor: Metal pointer not found in buffer mapping");
-          return Error::Internal;
-        }
-
+      // Check if this is a Metal buffer or CPU tensor
+      auto it = ptr_to_mtl_buffer.find(data_ptr);
+      if (it != ptr_to_mtl_buffer.end()) {
+        // This tensor data lives in a Metal buffer - use setBuffer
         id<MTLBuffer> mtlBuffer = it->second;
         ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: Retrieved mtlBuffer=%p", mtlBuffer);
 
@@ -116,23 +101,49 @@ AOTITorchError aoti_torch_mps_set_arg_tensor(
                idx, offset);
 
       } else {
-        // This is a CPU tensor - handle as bytes
+        // This is a CPU tensor - handle as bytes or buffer depending on size
         int dims = et_tensor->dim();
-        ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: CPU tensor with dims=%d", dims);
+        size_t numel = et_tensor->numel();
+        size_t element_size = et_tensor->element_size();
+        size_t total_size = numel * element_size;
 
-        if (dims != 0) {
-          ET_LOG(Error, "aoti_torch_mps_set_arg_tensor: CPU tensor must be scalar (0-dim)");
-          return Error::InvalidArgument;
+        ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: CPU tensor with dims=%d, numel=%zu, element_size=%zu, total_size=%zu",
+               dims, numel, element_size, total_size);
+
+        // Metal has a limit of 4096 bytes for setBytes
+        // For larger data, we need to create a temporary buffer
+        if (total_size <= 4096) {
+          // Small data - use setBytes
+          ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: Using setBytes for small tensor (size=%zu)", total_size);
+          [encoder setBytes:data_ptr length:total_size atIndex:idx];
+        } else {
+          // Large data - create a temporary Metal buffer
+          ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: Creating temporary buffer for large tensor (size=%zu)", total_size);
+
+          // Get Metal device
+          id<MTLDevice> device = get_metal_device();
+          if (!device) {
+            ET_LOG(Error, "aoti_torch_mps_set_arg_tensor: Failed to get Metal device for large tensor");
+            return Error::Internal;
+          }
+
+          // Create temporary buffer
+          id<MTLBuffer> tempBuffer = [device newBufferWithBytes:data_ptr
+                                                         length:total_size
+                                                        options:MTLResourceStorageModeShared];
+          if (!tempBuffer) {
+            ET_LOG(Error, "aoti_torch_mps_set_arg_tensor: Failed to create temporary buffer");
+            return Error::Internal;
+          }
+
+          // Use setBuffer instead of setBytes
+          [encoder setBuffer:tempBuffer offset:0 atIndex:idx];
+
+          ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: Successfully set large CPU tensor as buffer at index %u", idx);
         }
 
-        // For CPU scalars, set as bytes
-        size_t element_size = et_tensor->element_size();
-        ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: About to call setBytes with idx=%u, element_size=%zu", idx, element_size);
-
-        [encoder setBytes:data_ptr length:element_size atIndex:idx];
-
-        ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: Successfully set CPU scalar at index %u with size %zu",
-               idx, element_size);
+        ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: Successfully set CPU tensor at index %u with size %zu",
+               idx, total_size);
       }
 
       ET_LOG(Debug, "aoti_torch_mps_set_arg_tensor: Completed successfully");
@@ -256,7 +267,7 @@ AOTITorchError aoti_torch_mps_convolution(
     int64_t groups,
     AtenTensorHandle* ret0) {
 
-  ET_LOG(Debug, "aoti_torch_mps_convolution: Starting with input=%p, weight=%p, bias=%p, groups=%ld, transposed=%d",
+  ET_LOG(Debug, "aoti_torch_mps_convolution: Starting with input=%p, weight=%p, bias=%p, groups=%lld, transposed=%d",
          input, weight, bias, groups, transposed);
 
   if (!input || !weight || !ret0) {
@@ -296,16 +307,16 @@ AOTITorchError aoti_torch_mps_convolution(
 
       // Log convolution parameters
       if (stride && stride_len_ >= 2) {
-        ET_LOG(Debug, "aoti_torch_mps_convolution: stride: [%ld, %ld]", stride[0], stride[1]);
+        ET_LOG(Debug, "aoti_torch_mps_convolution: stride: [%lld, %lld]", stride[0], stride[1]);
       }
       if (padding && padding_len_ >= 2) {
-        ET_LOG(Debug, "aoti_torch_mps_convolution: padding: [%ld, %ld]", padding[0], padding[1]);
+        ET_LOG(Debug, "aoti_torch_mps_convolution: padding: [%lld, %lld]", padding[0], padding[1]);
       }
       if (dilation && dilation_len_ >= 2) {
-        ET_LOG(Debug, "aoti_torch_mps_convolution: dilation: [%ld, %ld]", dilation[0], dilation[1]);
+        ET_LOG(Debug, "aoti_torch_mps_convolution: dilation: [%lld, %lld]", dilation[0], dilation[1]);
       }
       if (output_padding && output_padding_len_ >= 2) {
-        ET_LOG(Debug, "aoti_torch_mps_convolution: output_padding: [%ld, %ld]", output_padding[0], output_padding[1]);
+        ET_LOG(Debug, "aoti_torch_mps_convolution: output_padding: [%lld, %lld]", output_padding[0], output_padding[1]);
       }
 
       // Calculate output dimensions
@@ -334,32 +345,67 @@ AOTITorchError aoti_torch_mps_convolution(
       int64_t H_out = (H_in + 2 * pad_h - dil_h * (kernel_h - 1) - 1) / stride_h + 1;
       int64_t W_out = (W_in + 2 * pad_w - dil_w * (kernel_w - 1) - 1) / stride_w + 1;
 
-      ET_LOG(Debug, "aoti_torch_mps_convolution: Calculated output shape: [%ld, %ld, %ld, %ld]", N, C_out, H_out, W_out);
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Calculated output shape: [%lld, %lld, %lld, %lld]", N, C_out, H_out, W_out);
+
+      // Validate output dimensions are positive
+      if (N <= 0 || C_out <= 0 || H_out <= 0 || W_out <= 0) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Invalid output dimensions N=%lld, C_out=%lld, H_out=%lld, W_out=%lld",
+               N, C_out, H_out, W_out);
+        return Error::InvalidArgument;
+      }
 
       // Create output tensor with calculated dimensions
       std::vector<int32_t> output_sizes = {(int32_t)N, (int32_t)C_out, (int32_t)H_out, (int32_t)W_out};
 
-      auto output_tensor = executorch::extension::make_tensor_ptr(
+      // Calculate expected number of elements
+      size_t expected_numel = N * C_out * H_out * W_out;
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Expected output tensor numel = %zu", expected_numel);
+
+      // Log the sizes vector for debugging
+      ET_LOG(Debug, "aoti_torch_mps_convolution: output_sizes vector: [%d, %d, %d, %d]",
+             output_sizes[0], output_sizes[1], output_sizes[2], output_sizes[3]);
+
+      // Allocate memory for the tensor data
+      size_t tensor_size_bytes = expected_numel * sizeof(float);
+      void* tensor_data = std::malloc(tensor_size_bytes);
+      if (!tensor_data) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Failed to allocate %zu bytes for tensor", tensor_size_bytes);
+        return Error::Internal;
+      }
+
+      // Zero out the allocated memory
+      std::memset(tensor_data, 0, tensor_size_bytes);
+
+      // Create tensor using from_blob to ensure we have control over the memory
+      auto output_tensor = executorch::extension::from_blob(
+          tensor_data,
           output_sizes,
-          executorch::runtime::etensor::ScalarType::Float // float32 scalar type
+          executorch::runtime::etensor::ScalarType::Float
       );
 
       if (!output_tensor) {
         ET_LOG(Error, "aoti_torch_mps_convolution: Failed to create output tensor");
+        std::free(tensor_data);  // Free the allocated memory on failure
         return Error::Internal;
       }
 
-      // Zero out the output tensor (placeholder implementation)
-      float* out_data = static_cast<float*>(output_tensor->mutable_data_ptr());
-      size_t out_numel = output_tensor->numel();
-      std::memset(out_data, 0, out_numel * sizeof(float));
+      // Verify the tensor was created with the correct size
+      size_t actual_numel = output_tensor->numel();
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created tensor with actual numel = %zu", actual_numel);
 
-      // Store the tensor so it doesn't get destroyed
+      if (actual_numel != expected_numel) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Tensor size mismatch. Expected %zu, got %zu", expected_numel, actual_numel);
+        std::free(tensor_data);  // Free the allocated memory on failure
+        return Error::Internal;
+      }
+
+      // Store the tensor so it doesn't get destroyed - mark that we own the memory
+      // since we manually allocated it with malloc
       tensors.insert(output_tensor);
       *ret0 = reinterpret_cast<AtenTensorHandle>(output_tensor.get());
-      is_tensor_own_memory[output_tensor.get()] = true;  // We created this tensor
+      is_tensor_own_memory[output_tensor.get()] = true;  // We allocated the memory manually
 
-      ET_LOG(Debug, "aoti_torch_mps_convolution: Created zero-filled output tensor with %zu elements", out_numel);
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created zero-filled output tensor with %zu elements", actual_numel);
       return Error::Ok;
 
     } catch (const std::exception& e) {

@@ -133,4 +133,15 @@ int metal_copy_memory(void* dst, const void* src, size_t nbytes, bool src_is_dev
   return 0;
 }
 
+// Helper functions to access Metal objects for MPS operations
+id<MTLDevice> get_metal_device() {
+  metal_init_if_needed();
+  return metalDevice;
+}
+
+id<MTLCommandQueue> get_metal_command_queue() {
+  metal_init_if_needed();
+  return metalCommandQueue;
+}
+
 } // extern "C"
