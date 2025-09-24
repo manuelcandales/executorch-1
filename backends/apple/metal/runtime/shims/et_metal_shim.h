@@ -26,6 +26,14 @@ class Tensor;
 namespace executorch {
 namespace backends {
 namespace aoti {
+class ETMetalStream;
+}
+}
+}
+
+namespace executorch {
+namespace backends {
+namespace aoti {
 
 // Forward declarations
 class ETMetalKernelFunction;
@@ -66,6 +74,7 @@ public:
                                    const uint64_t* group_size, size_t group_size_size);
 
     void runCommandBlock(std::function<void(void)> f);
+    void endEncoding();
 
 private:
     id<MTLComputePipelineState> cps_;

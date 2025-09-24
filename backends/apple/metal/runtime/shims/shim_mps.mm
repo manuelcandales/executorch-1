@@ -13,6 +13,7 @@
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include "shim_mps.h"
 #include "et_metal_shim.h"
+#include "et_metal_stream.h"
 #include "metal_helper.h"
 #include "utils.h"
 #include "memory.h"
@@ -456,15 +457,9 @@ AOTITorchError aoti_torch_mps_copy_buffer(
 AOTITorchError aoti_torch_mps_synchronize_stream() {
     @autoreleasepool {
         try {
-            id<MTLCommandQueue> commandQueue = get_metal_command_queue();
-            if (!commandQueue) {
-                ET_LOG(Error, "aoti_torch_mps_synchronize_stream: Failed to get command queue");
-                return Error::Internal;
-            }
-
-            id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-            [commandBuffer commit];
-            [commandBuffer waitUntilCompleted];
+            // Use the ETMetalStream for proper synchronization
+            ETMetalStream* stream = getCurrentMetalStream();
+            stream->synchronize();
 
             ET_LOG(Debug, "aoti_torch_mps_synchronize_stream: Stream synchronized");
             return Error::Ok;

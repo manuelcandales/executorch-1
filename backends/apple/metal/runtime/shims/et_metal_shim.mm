@@ -12,6 +12,7 @@
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include "et_metal_shim.h"
+#include "et_metal_stream.h"
 #include "metal_helper.h"
 #include "memory.h"
 
@@ -148,21 +149,11 @@ void ETMetalKernelFunction::startEncoding() {
             encoder_ = nil;
         }
 
-        id<MTLCommandQueue> commandQueue = get_metal_command_queue();
-        if (!commandQueue) {
-            ET_LOG(Error, "ETMetalKernelFunction: Failed to get command queue");
-            return;
-        }
-
-        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-        if (!commandBuffer) {
-            ET_LOG(Error, "ETMetalKernelFunction: Failed to create command buffer");
-            return;
-        }
-
-        encoder_ = [commandBuffer computeCommandEncoder];
+        // Get encoder from the current Metal stream
+        ETMetalStream* stream = getCurrentMetalStream();
+        encoder_ = stream->getComputeCommandEncoder();
         if (!encoder_) {
-            ET_LOG(Error, "ETMetalKernelFunction: Failed to create compute command encoder");
+            ET_LOG(Error, "ETMetalKernelFunction: Failed to get encoder from stream");
             return;
         }
 
@@ -228,6 +219,9 @@ void ETMetalKernelFunction::dispatchSingle(uint64_t length) {
 
     [encoder_ dispatchThreads:size threadsPerThreadgroup:threadGroupSize];
     ET_LOG(Debug, "ETMetalKernelFunction::dispatchSingle: Dispatched with length %llu, group size %llu", length, actualGroupSize);
+
+    // End encoding after dispatch
+    endEncoding();
 }
 
 void ETMetalKernelFunction::dispatchSingleWithGroupSize(uint64_t length, uint64_t group_size) {
@@ -244,6 +238,9 @@ void ETMetalKernelFunction::dispatchSingleWithGroupSize(uint64_t length, uint64_
 
     [encoder_ dispatchThreads:size threadsPerThreadgroup:threadGroupSize];
     ET_LOG(Debug, "ETMetalKernelFunction::dispatchSingleWithGroupSize: Dispatched with length %llu, group size %llu", length, actualGroupSize);
+
+    // End encoding after dispatch
+    endEncoding();
 }
 
 void ETMetalKernelFunction::dispatchArray(const uint64_t* length, size_t length_size) {
@@ -283,6 +280,9 @@ void ETMetalKernelFunction::dispatchArray(const uint64_t* length, size_t length_
     ET_LOG(Debug, "ETMetalKernelFunction::dispatchArray: Dispatched %zuD with size [%lu, %lu, %lu], group [%lu, %lu, %lu]",
            length_size, size.width, size.height, size.depth,
            threadGroupSize.width, threadGroupSize.height, threadGroupSize.depth);
+
+    // End encoding after dispatch
+    endEncoding();
 }
 
 void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, size_t length_size,
@@ -335,6 +335,27 @@ void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, s
     ET_LOG(Debug, "ETMetalKernelFunction::dispatchArrayWithGroupSize: Dispatched %zuD with size [%lu, %lu, %lu], group [%lu, %lu, %lu]",
            length_size, size.width, size.height, size.depth,
            threadGroupSize.width, threadGroupSize.height, threadGroupSize.depth);
+
+    // End encoding after dispatch
+    endEncoding();
+}
+
+void ETMetalKernelFunction::endEncoding() {
+    @autoreleasepool {
+        if (!encoder_) {
+            ET_LOG(Error, "ETMetalKernelFunction::endEncoding: No active encoder");
+            return;
+        }
+
+        // Use the stream to properly end encoding and commit
+        ETMetalStream* stream = getCurrentMetalStream();
+        stream->endEncoding(encoder_);
+
+        [encoder_ release];
+        encoder_ = nil;
+
+        ET_LOG(Debug, "ETMetalKernelFunction::endEncoding: Ended encoding");
+    }
 }
 
 void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
@@ -347,15 +368,8 @@ void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
         // Execute the command block
         f();
 
-        // End encoding and commit
-        [encoder_ endEncoding];
-
-        // Get the command buffer that created this encoder (need to store it during startEncoding)
-        // For now, create a new command buffer and commit it to synchronize
-        id<MTLCommandQueue> commandQueue = get_metal_command_queue();
-        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-        [commandBuffer commit];
-        [commandBuffer waitUntilCompleted];
+        // End encoding after command block execution
+        endEncoding();
 
         ET_LOG(Debug, "ETMetalKernelFunction::runCommandBlock: Executed command block");
     }
