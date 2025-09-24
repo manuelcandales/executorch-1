@@ -524,14 +524,6 @@ ETMetalStream::~ETMetalStream() {
             serialQueue_ = nullptr;
         }
 
-        // Legacy compatibility cleanup
-        for (auto& buffer : activeCommandBuffers_) {
-            if (buffer) {
-                [buffer release];
-            }
-        }
-        activeCommandBuffers_.clear();
-
         ET_LOG(Debug, "ETMetalStream: Destroyed stream");
     }
 }
@@ -740,33 +732,13 @@ void ETMetalStream::copy(id<MTLBuffer> srcBuffer, id<MTLBuffer> dstBuffer, size_
     });
 }
 
-// Compatibility methods
-id<MTLCommandBuffer> ETMetalStream::getCommandBuffer() {
-    return commandBuffer();
-}
-
-void ETMetalStream::commitCommandBuffer(id<MTLCommandBuffer> commandBuffer) {
-    if (commandBuffer) {
-        [commandBuffer commit];
-        ET_LOG(Debug, "ETMetalStream::commitCommandBuffer: Committed command buffer %p", commandBuffer);
-    }
-}
-
-id<MTLComputeCommandEncoder> ETMetalStream::getComputeCommandEncoder() {
-    return commandEncoder();
-}
-
-void ETMetalStream::endEncoding(id<MTLComputeCommandEncoder> encoder) {
-    // Don't end encoding here - the stream manages this through coalescing
-    ET_LOG(Debug, "ETMetalStream::endEncoding: Legacy method called for encoder %p - encoding managed by stream", encoder);
-}
 
 void ETMetalStream::synchronize() {
     synchronize(SyncType::COMMIT_AND_WAIT);
 }
 
 bool ETMetalStream::isEmpty() const {
-    return !commandBuffer_ && !commandEncoder_ && activeCommandBuffers_.empty();
+    return !commandBuffer_ && !commandEncoder_;
 }
 
 // =======================

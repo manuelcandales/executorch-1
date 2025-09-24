@@ -152,14 +152,9 @@ public:
     void endKernelCoalescing();
 
     // Command buffer lifecycle management
-    id<MTLCommandBuffer> getCommandBuffer(); // Legacy compatibility method
     void commitCommandBuffer(id<MTLCommandBuffer> commandBuffer);
     void flush();
     bool isEmpty() const;
-
-    // Encoder management
-    id<MTLComputeCommandEncoder> getComputeCommandEncoder();
-    void endEncoding(id<MTLComputeCommandEncoder> encoder);
 
     // Memory operations
     void fill(id<MTLBuffer> buffer, uint8_t value, size_t length, size_t offset, SyncType syncType = SyncType::NONE);
@@ -177,9 +172,6 @@ private:
 
     // Configuration
     bool enableCommitAndContinue_;
-
-    // Legacy compatibility
-    std::vector<id<MTLCommandBuffer>> activeCommandBuffers_;
 
     // Private synchronization methods
     void commit();
