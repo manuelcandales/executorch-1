@@ -12,7 +12,6 @@
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include "et_metal.h"
-#include "memory.h"
 #include <algorithm>
 
 namespace executorch {
@@ -23,7 +22,7 @@ namespace aoti {
 // Global Variables and Storage
 // =======================
 
-// Metal device and command queue globals
+// Legacy Metal globals (will be deprecated in favor of stream-based approach)
 static id<MTLDevice> metalDevice = nil;
 static id<MTLCommandQueue> metalCommandQueue = nil;
 
@@ -131,13 +130,15 @@ int metal_copy_memory(void* dst, const void* src, size_t nbytes, bool src_is_dev
 }
 
 id<MTLDevice> get_metal_device() {
-    metal_init_if_needed();
-    return metalDevice;
+    // Use PyTorch-style stream-based device access
+    ETMetalStream* stream = getCurrentMetalStream();
+    return stream->device();
 }
 
 id<MTLCommandQueue> get_metal_command_queue() {
-    metal_init_if_needed();
-    return metalCommandQueue;
+    // Use PyTorch-style stream-based queue access
+    ETMetalStream* stream = getCurrentMetalStream();
+    return stream->commandQueue();
 }
 
 } // extern "C"
@@ -506,28 +507,78 @@ void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
 // ETMetalStream Implementation
 // =======================
 
-ETMetalStream::ETMetalStream() {
+ETMetalStream::ETMetalStream()
+    : device_(nil), commandQueue_(nil), commandBuffer_(nil), prevCommandBuffer_(nil),
+      commandEncoder_(nil), serialQueue_(nullptr), enableCommitAndContinue_(true) {
     @autoreleasepool {
-        commandQueue_ = get_metal_command_queue();
-        if (commandQueue_) {
-            [commandQueue_ retain];
-            ET_LOG(Debug, "ETMetalStream: Created stream with command queue %p", commandQueue_);
-        } else {
-            ET_LOG(Error, "ETMetalStream: Failed to get Metal command queue");
+        // Create our own device and command queue like PyTorch
+        device_ = MTLCreateSystemDefaultDevice();
+        if (!device_) {
+            ET_LOG(Error, "ETMetalStream: Failed to create Metal device");
+            return;
         }
+        [device_ retain];
+
+        commandQueue_ = [device_ newCommandQueue];
+        if (!commandQueue_) {
+            ET_LOG(Error, "ETMetalStream: Failed to create Metal command queue");
+            return;
+        }
+        [commandQueue_ retain];
+
+        // Create serial queue for thread safety like PyTorch
+        serialQueue_ = dispatch_queue_create("metal gpu stream", nullptr);
+
+        ET_LOG(Debug, "ETMetalStream: Created PyTorch-style stream with device %p, queue %p", device_, commandQueue_);
     }
 }
 
 ETMetalStream::~ETMetalStream() {
     @autoreleasepool {
-        synchronize();
+        // Synchronize before cleanup
+        synchronize(SyncType::COMMIT_AND_WAIT);
 
+        // Clean up command encoder
+        if (commandEncoder_) {
+            [commandEncoder_ release];
+            commandEncoder_ = nil;
+        }
+
+        // Clean up command buffers
+        if (commandBuffer_) {
+            [commandBuffer_ release];
+            commandBuffer_ = nil;
+        }
+        if (prevCommandBuffer_) {
+            [prevCommandBuffer_ release];
+            prevCommandBuffer_ = nil;
+        }
+
+        // Clean up command queue and device
         if (commandQueue_) {
             [commandQueue_ release];
             commandQueue_ = nil;
         }
+        if (device_) {
+            [device_ release];
+            device_ = nil;
+        }
 
-        ET_LOG(Debug, "ETMetalStream: Destroyed stream");
+        // Clean up serial queue
+        if (serialQueue_) {
+            dispatch_release(serialQueue_);
+            serialQueue_ = nullptr;
+        }
+
+        // Legacy compatibility cleanup
+        for (auto& buffer : activeCommandBuffers_) {
+            if (buffer) {
+                [buffer release];
+            }
+        }
+        activeCommandBuffers_.clear();
+
+        ET_LOG(Debug, "ETMetalStream: Destroyed PyTorch-style stream");
     }
 }
 
@@ -538,122 +589,233 @@ ETMetalStream* ETMetalStream::getDefaultStream() {
     return defaultStream_;
 }
 
-id<MTLCommandBuffer> ETMetalStream::getCommandBuffer() {
-    @autoreleasepool {
+// PyTorch-style lazy command buffer creation
+id<MTLCommandBuffer> ETMetalStream::commandBuffer() {
+    if (!commandBuffer_) {
         if (!commandQueue_) {
-            ET_LOG(Error, "ETMetalStream::getCommandBuffer: No command queue available");
+            ET_LOG(Error, "ETMetalStream::commandBuffer: No command queue available");
             return nil;
         }
 
-        id<MTLCommandBuffer> commandBuffer = [commandQueue_ commandBuffer];
-        if (!commandBuffer) {
-            ET_LOG(Error, "ETMetalStream::getCommandBuffer: Failed to create command buffer");
+        commandBuffer_ = [commandQueue_ commandBuffer];
+        if (!commandBuffer_) {
+            ET_LOG(Error, "ETMetalStream::commandBuffer: Failed to create command buffer");
+            return nil;
+        }
+        [commandBuffer_ retain];
+
+        ET_LOG(Debug, "ETMetalStream::commandBuffer: Created lazy command buffer %p", commandBuffer_);
+    }
+
+    return commandBuffer_;
+}
+
+// PyTorch-style lazy command encoder creation
+id<MTLComputeCommandEncoder> ETMetalStream::commandEncoder() {
+    if (!commandEncoder_) {
+        id<MTLCommandBuffer> cmdBuffer = commandBuffer();
+        if (!cmdBuffer) {
+            ET_LOG(Error, "ETMetalStream::commandEncoder: Failed to get command buffer");
             return nil;
         }
 
-        activeCommandBuffers_.push_back(commandBuffer);
-        [commandBuffer retain];
+        commandEncoder_ = [cmdBuffer computeCommandEncoder];
+        if (!commandEncoder_) {
+            ET_LOG(Error, "ETMetalStream::commandEncoder: Failed to create command encoder");
+            return nil;
+        }
+        [commandEncoder_ retain];
 
-        ET_LOG(Debug, "ETMetalStream::getCommandBuffer: Created command buffer %p", commandBuffer);
-        return commandBuffer;
+        ET_LOG(Debug, "ETMetalStream::commandEncoder: Created lazy command encoder %p", commandEncoder_);
+    }
+
+    return commandEncoder_;
+}
+
+// PyTorch-style synchronization with SyncType
+void ETMetalStream::synchronize(SyncType syncType) {
+    dispatch_sync(serialQueue_, ^{
+        @autoreleasepool {
+            endKernelCoalescing();
+
+            switch (syncType) {
+                case SyncType::NONE:
+                    // Do nothing - no commit
+                    break;
+                case SyncType::COMMIT:
+                    commit();
+                    break;
+                case SyncType::COMMIT_AND_WAIT:
+                    commitAndWait();
+                    break;
+                case SyncType::COMMIT_AND_CONTINUE:
+                    if (enableCommitAndContinue_) {
+                        commitAndContinue();
+                    } else {
+                        ET_LOG(Warning, "ETMetalStream::synchronize: CommitAndContinue requested but disabled");
+                        commit();
+                    }
+                    break;
+                case SyncType::COMMIT_ADAPTIVE:
+                    // Simple adaptive policy - could be enhanced with memory pressure detection
+                    commit();
+                    break;
+            }
+
+            ET_LOG(Debug, "ETMetalStream::synchronize: Completed with SyncType %d", static_cast<int>(syncType));
+        }
+    });
+}
+
+// PyTorch-style encoder coalescing management
+void ETMetalStream::endKernelCoalescing() {
+    if (commandEncoder_) {
+        [commandEncoder_ endEncoding];
+        [commandEncoder_ release];
+        commandEncoder_ = nil;
+        ET_LOG(Debug, "ETMetalStream::endKernelCoalescing: Ended encoder coalescing");
     }
 }
 
-void ETMetalStream::commitCommandBuffer(id<MTLCommandBuffer> commandBuffer) {
-    @autoreleasepool {
-        if (!commandBuffer) {
-            ET_LOG(Error, "ETMetalStream::commitCommandBuffer: null command buffer");
-            return;
-        }
+// PyTorch-style commit methods
+void ETMetalStream::commit() {
+    if (enableCommitAndContinue_ && commandBuffer_) {
+        // PyTorch's commit-and-continue for better performance
+        commitAndContinue();
+    } else {
+        flush();
+    }
+}
 
+void ETMetalStream::commitAndWait() {
+    // Handle previous command buffer first
+    if (prevCommandBuffer_) {
+        [prevCommandBuffer_ waitUntilCompleted];
+        [prevCommandBuffer_ release];
+        prevCommandBuffer_ = nil;
+    }
+
+    // Handle current command buffer
+    if (commandBuffer_) {
+        [commandBuffer_ commit];
+        [commandBuffer_ waitUntilCompleted];
+        [commandBuffer_ release];
+        commandBuffer_ = nil;
+    }
+
+    ET_LOG(Debug, "ETMetalStream::commitAndWait: Committed and waited for completion");
+}
+
+void ETMetalStream::commitAndContinue() {
+    if (!commandBuffer_) {
+        ET_LOG(Warning, "ETMetalStream::commitAndContinue: No command buffer to commit");
+        return;
+    }
+
+    // This is the key PyTorch optimization - commitAndContinue allows reusing the same buffer
+    [commandBuffer_ commit];
+    ET_LOG(Debug, "ETMetalStream::commitAndContinue: Committed buffer %p with continue", commandBuffer_);
+
+    // Note: In PyTorch, commitAndContinue allows the buffer to be reused immediately
+    // The buffer itself handles the synchronization internally
+}
+
+void ETMetalStream::flush() {
+    if (commandBuffer_) {
+        [commandBuffer_ commit];
+
+        if (!enableCommitAndContinue_) {
+            // Keep the command buffer for later waiting if commit-and-continue is disabled
+            prevCommandBuffer_ = commandBuffer_;
+        } else {
+            [commandBuffer_ release];
+        }
+        commandBuffer_ = nil;
+
+        ET_LOG(Debug, "ETMetalStream::flush: Flushed command buffer");
+    }
+}
+
+// PyTorch-style memory operations
+void ETMetalStream::fill(id<MTLBuffer> buffer, uint8_t value, size_t length, size_t offset, SyncType syncType) {
+    if (length == 0) {
+        return;
+    }
+
+    dispatch_sync(serialQueue_, ^{
+        @autoreleasepool {
+            endKernelCoalescing();
+            id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer() blitCommandEncoder];
+
+            [blitEncoder fillBuffer:buffer range:NSMakeRange(offset, length) value:value];
+            [blitEncoder endEncoding];
+            synchronize(syncType);
+
+            ET_LOG(Debug, "ETMetalStream::fill: Filled buffer with value %u, length %zu, offset %zu", value, length, offset);
+        }
+    });
+}
+
+void ETMetalStream::copy(id<MTLBuffer> srcBuffer, id<MTLBuffer> dstBuffer, size_t length,
+                        size_t srcOffset, size_t dstOffset, SyncType syncType) {
+    dispatch_sync(serialQueue_, ^{
+        @autoreleasepool {
+            endKernelCoalescing();
+            id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer() blitCommandEncoder];
+
+            // Handle large copies in chunks like PyTorch does
+            constexpr size_t max_copy_size = 0x80000000; // 2GB
+            size_t bytes_copied = 0;
+            size_t bytes_remaining = length;
+
+            while (bytes_remaining > 0) {
+                NSUInteger bytes_to_copy = std::min(max_copy_size, bytes_remaining);
+                [blitEncoder copyFromBuffer:srcBuffer
+                               sourceOffset:(NSUInteger)srcOffset + bytes_copied
+                                   toBuffer:dstBuffer
+                          destinationOffset:(NSUInteger)dstOffset + bytes_copied
+                                       size:bytes_to_copy];
+                bytes_copied += bytes_to_copy;
+                bytes_remaining -= bytes_to_copy;
+            }
+
+            [blitEncoder endEncoding];
+            synchronize(syncType);
+
+            ET_LOG(Debug, "ETMetalStream::copy: Copied %zu bytes from offset %zu to offset %zu", length, srcOffset, dstOffset);
+        }
+    });
+}
+
+// Legacy compatibility methods
+id<MTLCommandBuffer> ETMetalStream::getCommandBuffer() {
+    return commandBuffer();
+}
+
+void ETMetalStream::commitCommandBuffer(id<MTLCommandBuffer> commandBuffer) {
+    if (commandBuffer) {
         [commandBuffer commit];
-        ET_LOG(Debug, "ETMetalStream::commitCommandBuffer: Committed command buffer %p", commandBuffer);
+        ET_LOG(Debug, "ETMetalStream::commitCommandBuffer: Committed legacy command buffer %p", commandBuffer);
     }
 }
 
 id<MTLComputeCommandEncoder> ETMetalStream::getComputeCommandEncoder() {
-    @autoreleasepool {
-        id<MTLCommandBuffer> commandBuffer = getCommandBuffer();
-        if (!commandBuffer) {
-            ET_LOG(Error, "ETMetalStream::getComputeCommandEncoder: Failed to get command buffer");
-            return nil;
-        }
-
-        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-        if (!encoder) {
-            ET_LOG(Error, "ETMetalStream::getComputeCommandEncoder: Failed to create compute command encoder");
-            return nil;
-        }
-
-        ET_LOG(Debug, "ETMetalStream::getComputeCommandEncoder: Created encoder %p from command buffer %p", encoder, commandBuffer);
-        return encoder;
-    }
+    return commandEncoder();
 }
 
 void ETMetalStream::endEncoding(id<MTLComputeCommandEncoder> encoder) {
-    @autoreleasepool {
-        if (!encoder) {
-            ET_LOG(Error, "ETMetalStream::endEncoding: null encoder");
-            return;
-        }
-
+    if (encoder) {
         [encoder endEncoding];
-
-        id<MTLCommandBuffer> commandBuffer = [encoder commandBuffer];
-        if (commandBuffer) {
-            commitCommandBuffer(commandBuffer);
-        }
-
-        ET_LOG(Debug, "ETMetalStream::endEncoding: Ended encoding for encoder %p", encoder);
+        ET_LOG(Debug, "ETMetalStream::endEncoding: Ended encoding for legacy encoder %p", encoder);
     }
 }
 
 void ETMetalStream::synchronize() {
-    @autoreleasepool {
-        ET_LOG(Debug, "ETMetalStream::synchronize: Synchronizing %zu active command buffers", activeCommandBuffers_.size());
-
-        for (auto& commandBuffer : activeCommandBuffers_) {
-            if (commandBuffer) {
-                [commandBuffer waitUntilCompleted];
-                [commandBuffer release];
-            }
-        }
-
-        activeCommandBuffers_.clear();
-
-        ET_LOG(Debug, "ETMetalStream::synchronize: Synchronization complete");
-    }
-}
-
-void ETMetalStream::flush() {
-    @autoreleasepool {
-        // Clean up completed command buffers to prevent memory growth
-        auto it = std::remove_if(activeCommandBuffers_.begin(), activeCommandBuffers_.end(),
-            [](id<MTLCommandBuffer> commandBuffer) {
-                if (!commandBuffer) {
-                    return true; // Remove null entries
-                }
-
-                MTLCommandBufferStatus status = [commandBuffer status];
-                if (status == MTLCommandBufferStatusCompleted ||
-                    status == MTLCommandBufferStatusError) {
-                    [commandBuffer release];
-                    return true;
-                }
-                return false;
-            });
-
-        size_t removedCount = activeCommandBuffers_.end() - it;
-        activeCommandBuffers_.erase(it, activeCommandBuffers_.end());
-
-        if (removedCount > 0) {
-            ET_LOG(Debug, "ETMetalStream::flush: Cleaned up %zu completed command buffers", removedCount);
-        }
-    }
+    synchronize(SyncType::COMMIT_AND_WAIT);
 }
 
 bool ETMetalStream::isEmpty() const {
-    return activeCommandBuffers_.empty();
+    return !commandBuffer_ && !commandEncoder_ && activeCommandBuffers_.empty();
 }
 
 // =======================
