@@ -22,7 +22,7 @@
 
 #include <cstdint> // Ensure we have int64_t, int32_t definitions
 
-#include "metal_helper.h"
+#include "et_metal.h"
 
 namespace executorch {
 namespace backends {

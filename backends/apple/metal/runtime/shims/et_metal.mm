@@ -11,36 +11,158 @@
 #import <Foundation/Foundation.h>
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
-#include "et_metal_shim.h"
-#include "et_metal_stream.h"
-#include "metal_helper.h"
+#include "et_metal.h"
 #include "memory.h"
+#include <algorithm>
 
 namespace executorch {
 namespace backends {
 namespace aoti {
 
-// Global storage to keep shared_ptr alive while raw pointers are used (matching PyTorch pattern)
+// =======================
+// Global Variables and Storage
+// =======================
+
+// Metal device and command queue globals
+static id<MTLDevice> metalDevice = nil;
+static id<MTLCommandQueue> metalCommandQueue = nil;
+
+// Global Metal buffer mapping - accessible for MPS shim
+std::unordered_map<void*, id<MTLBuffer>> ptr_to_mtl_buffer;
+
+// Global storage to keep shared_ptr alive while raw pointers are used
 static std::unordered_map<ETMetalKernelFunction*, std::shared_ptr<ETMetalKernelFunction>> function_storage;
 static std::unordered_map<ETMetalShaderLibrary*, std::unique_ptr<ETMetalShaderLibrary>> library_storage;
 
+// Static singleton instance for default stream
+ETMetalStream* ETMetalStream::defaultStream_ = nullptr;
+
+// Thread-local current stream
+static thread_local ETMetalStream* currentStream_ = nullptr;
+
+// =======================
+// Metal Helper Functions (C Interface)
+// =======================
+
+extern "C" {
+
+void metal_init_if_needed() {
+    if (!metalDevice) {
+        @autoreleasepool {
+            metalDevice = MTLCreateSystemDefaultDevice();
+            if (!metalDevice) {
+                ET_LOG(Error, "Failed to create Metal device");
+                return;
+            }
+
+            metalCommandQueue = [metalDevice newCommandQueue];
+            if (!metalCommandQueue) {
+                ET_LOG(Error, "Failed to create Metal command queue");
+                return;
+            }
+            ET_LOG(Info, "Metal initialized successfully");
+        }
+    }
+}
+
+void* metal_allocate_buffer(long bytes) {
+    metal_init_if_needed();
+    if (!metalDevice) {
+        ET_LOG(Error, "Failed to initialize Metal device");
+        return nullptr;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> buffer = [metalDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!buffer) {
+            ET_LOG(Error, "Failed to allocate %ld bytes on Metal device", bytes);
+            return nullptr;
+        }
+
+        void* ptr = [buffer contents];
+        ptr_to_mtl_buffer[ptr] = buffer;
+
+        ET_LOG(Debug, "Allocated %ld bytes on Metal device", bytes);
+        return ptr;
+    }
+}
+
+void metal_cleanup_resources() {
+    if (!ptr_to_mtl_buffer.empty()) {
+        @autoreleasepool {
+            for (auto& pair : ptr_to_mtl_buffer) {
+                pair.second = nil;
+            }
+            ptr_to_mtl_buffer.clear();
+        }
+    }
+
+    metalCommandQueue = nil;
+    metalDevice = nil;
+}
+
+bool metal_is_device_pointer(void* ptr) {
+    return ptr_to_mtl_buffer.find(ptr) != ptr_to_mtl_buffer.end();
+}
+
+int metal_copy_memory(void* dst, const void* src, size_t nbytes, bool src_is_device, bool dst_is_device) {
+    if (!src || !dst || nbytes == 0) {
+        ET_LOG(Error, "Metal copy: Invalid parameters");
+        return -1;
+    }
+
+    @autoreleasepool {
+        std::memcpy(dst, src, nbytes);
+
+        // For shared memory buffers, synchronization is typically not needed
+        // since both CPU and GPU access the same memory space
+        if ((src_is_device || dst_is_device) && metalCommandQueue) {
+            // Only synchronize if we actually need to ensure GPU operations complete
+            id<MTLCommandBuffer> commandBuffer = [metalCommandQueue commandBuffer];
+            if (commandBuffer) {
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+            }
+        }
+    }
+
+    ET_LOG(Debug, "Metal memory copy completed: %zu bytes", nbytes);
+    return 0;
+}
+
+id<MTLDevice> get_metal_device() {
+    metal_init_if_needed();
+    return metalDevice;
+}
+
+id<MTLCommandQueue> get_metal_command_queue() {
+    metal_init_if_needed();
+    return metalCommandQueue;
+}
+
+} // extern "C"
+
+// =======================
 // ETMetalShaderLibrary Implementation
+// =======================
+
 ETMetalShaderLibrary::ETMetalShaderLibrary(const std::string& source) : shaderSource_(source) {
     compileLibrary();
 }
 
 ETMetalShaderLibrary::~ETMetalShaderLibrary() {
-    if (library_) {
-        [library_ release];
-        library_ = nil;
-    }
+    @autoreleasepool {
+        if (library_) {
+            [library_ release];
+            library_ = nil;
+        }
 
-    // Clean up pipeline states
-    for (auto& pair : pipelineStates_) {
-        [pair.second.first release];  // MTLComputePipelineState
-        [pair.second.second release]; // MTLFunction
+        for (auto& pair : pipelineStates_) {
+            [pair.second.first release];
+            [pair.second.second release];
+        }
+        pipelineStates_.clear();
     }
-    pipelineStates_.clear();
 }
 
 void ETMetalShaderLibrary::compileLibrary() {
@@ -100,7 +222,6 @@ std::pair<id<MTLComputePipelineState>, id<MTLFunction>> ETMetalShaderLibrary::ge
             return {nil, nil};
         }
 
-        // Retain objects and store in cache
         [pipelineState retain];
         [function retain];
         pipelineStates_[functionName] = {pipelineState, function};
@@ -120,7 +241,10 @@ std::shared_ptr<ETMetalKernelFunction> ETMetalShaderLibrary::getKernelFunction(c
     return std::make_shared<ETMetalKernelFunction>(pipelineStatePair.first, pipelineStatePair.second);
 }
 
+// =======================
 // ETMetalKernelFunction Implementation
+// =======================
+
 ETMetalKernelFunction::ETMetalKernelFunction(id<MTLComputePipelineState> cps, id<MTLFunction> func)
     : cps_(cps), func_(func), encoder_(nil) {
     if (cps_) [cps_ retain];
@@ -128,17 +252,19 @@ ETMetalKernelFunction::ETMetalKernelFunction(id<MTLComputePipelineState> cps, id
 }
 
 ETMetalKernelFunction::~ETMetalKernelFunction() {
-    if (encoder_) {
-        [encoder_ release];
-        encoder_ = nil;
-    }
-    if (cps_) {
-        [cps_ release];
-        cps_ = nil;
-    }
-    if (func_) {
-        [func_ release];
-        func_ = nil;
+    @autoreleasepool {
+        if (encoder_) {
+            [encoder_ release];
+            encoder_ = nil;
+        }
+        if (cps_) {
+            [cps_ release];
+            cps_ = nil;
+        }
+        if (func_) {
+            [func_ release];
+            func_ = nil;
+        }
     }
 }
 
@@ -149,7 +275,6 @@ void ETMetalKernelFunction::startEncoding() {
             encoder_ = nil;
         }
 
-        // Get encoder from the current Metal stream
         ETMetalStream* stream = getCurrentMetalStream();
         encoder_ = stream->getComputeCommandEncoder();
         if (!encoder_) {
@@ -171,26 +296,38 @@ void ETMetalKernelFunction::setArg(unsigned idx, const executorch::runtime::eten
     }
 
     void* data_ptr = tensor.mutable_data_ptr();
+    size_t totalSize = tensor.numel() * tensor.element_size();
 
-    // Check if this is a Metal buffer or CPU tensor
     auto it = ptr_to_mtl_buffer.find(data_ptr);
     if (it != ptr_to_mtl_buffer.end()) {
-        // This tensor data lives in a Metal buffer
+        // Use existing Metal buffer
         id<MTLBuffer> mtlBuffer = it->second;
         [encoder_ setBuffer:mtlBuffer offset:0 atIndex:idx];
-        ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set Metal buffer at index %u", idx);
+        ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set Metal buffer at index %u (size: %zu)", idx, totalSize);
     } else {
-        // CPU tensor - use setBytes for small data or create temporary buffer for large data
-        size_t totalSize = tensor.numel() * tensor.element_size();
+        // Handle CPU tensor data
         if (totalSize <= 4096) {
+            // Use setBytes for small data (more efficient)
             [encoder_ setBytes:data_ptr length:totalSize atIndex:idx];
-            ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set CPU tensor via setBytes at index %u", idx);
+            ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set CPU tensor via setBytes at index %u (size: %zu)", idx, totalSize);
         } else {
-            // Create temporary buffer for large data
-            id<MTLDevice> device = get_metal_device();
-            id<MTLBuffer> tempBuffer = [device newBufferWithBytes:data_ptr length:totalSize options:MTLResourceStorageModeShared];
-            [encoder_ setBuffer:tempBuffer offset:0 atIndex:idx];
-            ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set large CPU tensor via temporary buffer at index %u", idx);
+            // Create temporary buffer for large data (should be rare)
+            @autoreleasepool {
+                id<MTLDevice> device = get_metal_device();
+                if (device) {
+                    id<MTLBuffer> tempBuffer = [device newBufferWithBytes:data_ptr
+                                                                   length:totalSize
+                                                                  options:MTLResourceStorageModeShared];
+                    if (tempBuffer) {
+                        [encoder_ setBuffer:tempBuffer offset:0 atIndex:idx];
+                        ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set large CPU tensor via temporary buffer at index %u (size: %zu)", idx, totalSize);
+                    } else {
+                        ET_LOG(Error, "ETMetalKernelFunction::setArg: Failed to create temporary buffer for index %u", idx);
+                    }
+                } else {
+                    ET_LOG(Error, "ETMetalKernelFunction::setArg: No Metal device available for index %u", idx);
+                }
+            }
         }
     }
 }
@@ -220,7 +357,6 @@ void ETMetalKernelFunction::dispatchSingle(uint64_t length) {
     [encoder_ dispatchThreads:size threadsPerThreadgroup:threadGroupSize];
     ET_LOG(Debug, "ETMetalKernelFunction::dispatchSingle: Dispatched with length %llu, group size %llu", length, actualGroupSize);
 
-    // End encoding after dispatch
     endEncoding();
 }
 
@@ -239,7 +375,6 @@ void ETMetalKernelFunction::dispatchSingleWithGroupSize(uint64_t length, uint64_
     [encoder_ dispatchThreads:size threadsPerThreadgroup:threadGroupSize];
     ET_LOG(Debug, "ETMetalKernelFunction::dispatchSingleWithGroupSize: Dispatched with length %llu, group size %llu", length, actualGroupSize);
 
-    // End encoding after dispatch
     endEncoding();
 }
 
@@ -256,7 +391,6 @@ void ETMetalKernelFunction::dispatchArray(const uint64_t* length, size_t length_
 
     const auto maxThreadsPerGroup = static_cast<uint64_t>([cps_ maxTotalThreadsPerThreadgroup]);
 
-    // Handle 1D, 2D, and 3D dispatch
     MTLSize size, threadGroupSize;
 
     if (length_size == 1) {
@@ -268,7 +402,7 @@ void ETMetalKernelFunction::dispatchArray(const uint64_t* length, size_t length_
         uint64_t groupX = std::min(static_cast<uint64_t>(32), length[0]);
         uint64_t groupY = maxThreadsPerGroup / groupX;
         threadGroupSize = MTLSizeMake(groupX, groupY, 1);
-    } else { // 3D or higher - treat as 3D
+    } else {
         size = MTLSizeMake(length[0], length[1], length_size > 2 ? length[2] : 1);
         uint64_t groupX = std::min(static_cast<uint64_t>(8), length[0]);
         uint64_t groupY = std::min(static_cast<uint64_t>(8), length[1]);
@@ -281,7 +415,6 @@ void ETMetalKernelFunction::dispatchArray(const uint64_t* length, size_t length_
            length_size, size.width, size.height, size.depth,
            threadGroupSize.width, threadGroupSize.height, threadGroupSize.depth);
 
-    // End encoding after dispatch
     endEncoding();
 }
 
@@ -299,7 +432,6 @@ void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, s
 
     const auto maxThreadsPerGroup = static_cast<uint64_t>([cps_ maxTotalThreadsPerThreadgroup]);
 
-    // Handle 1D, 2D, and 3D dispatch
     MTLSize size, threadGroupSize;
 
     if (length_size == 1) {
@@ -318,7 +450,7 @@ void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, s
             groupY = std::min(static_cast<uint64_t>(group_size[1]), length[1]);
         }
         threadGroupSize = MTLSizeMake(groupX, groupY, 1);
-    } else { // 3D or higher - treat as 3D
+    } else {
         size = MTLSizeMake(length[0], length[1], length_size > 2 ? length[2] : 1);
         uint64_t groupX = std::min(static_cast<uint64_t>(8), length[0]);
         uint64_t groupY = std::min(static_cast<uint64_t>(8), length[1]);
@@ -336,7 +468,6 @@ void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, s
            length_size, size.width, size.height, size.depth,
            threadGroupSize.width, threadGroupSize.height, threadGroupSize.depth);
 
-    // End encoding after dispatch
     endEncoding();
 }
 
@@ -347,7 +478,6 @@ void ETMetalKernelFunction::endEncoding() {
             return;
         }
 
-        // Use the stream to properly end encoding and commit
         ETMetalStream* stream = getCurrentMetalStream();
         stream->endEncoding(encoder_);
 
@@ -365,17 +495,171 @@ void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
             return;
         }
 
-        // Execute the command block
         f();
-
-        // End encoding after command block execution
         endEncoding();
 
         ET_LOG(Debug, "ETMetalKernelFunction::runCommandBlock: Executed command block");
     }
 }
 
-// Global storage management functions
+// =======================
+// ETMetalStream Implementation
+// =======================
+
+ETMetalStream::ETMetalStream() {
+    @autoreleasepool {
+        commandQueue_ = get_metal_command_queue();
+        if (commandQueue_) {
+            [commandQueue_ retain];
+            ET_LOG(Debug, "ETMetalStream: Created stream with command queue %p", commandQueue_);
+        } else {
+            ET_LOG(Error, "ETMetalStream: Failed to get Metal command queue");
+        }
+    }
+}
+
+ETMetalStream::~ETMetalStream() {
+    @autoreleasepool {
+        synchronize();
+
+        if (commandQueue_) {
+            [commandQueue_ release];
+            commandQueue_ = nil;
+        }
+
+        ET_LOG(Debug, "ETMetalStream: Destroyed stream");
+    }
+}
+
+ETMetalStream* ETMetalStream::getDefaultStream() {
+    if (!defaultStream_) {
+        defaultStream_ = new ETMetalStream();
+    }
+    return defaultStream_;
+}
+
+id<MTLCommandBuffer> ETMetalStream::getCommandBuffer() {
+    @autoreleasepool {
+        if (!commandQueue_) {
+            ET_LOG(Error, "ETMetalStream::getCommandBuffer: No command queue available");
+            return nil;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [commandQueue_ commandBuffer];
+        if (!commandBuffer) {
+            ET_LOG(Error, "ETMetalStream::getCommandBuffer: Failed to create command buffer");
+            return nil;
+        }
+
+        activeCommandBuffers_.push_back(commandBuffer);
+        [commandBuffer retain];
+
+        ET_LOG(Debug, "ETMetalStream::getCommandBuffer: Created command buffer %p", commandBuffer);
+        return commandBuffer;
+    }
+}
+
+void ETMetalStream::commitCommandBuffer(id<MTLCommandBuffer> commandBuffer) {
+    @autoreleasepool {
+        if (!commandBuffer) {
+            ET_LOG(Error, "ETMetalStream::commitCommandBuffer: null command buffer");
+            return;
+        }
+
+        [commandBuffer commit];
+        ET_LOG(Debug, "ETMetalStream::commitCommandBuffer: Committed command buffer %p", commandBuffer);
+    }
+}
+
+id<MTLComputeCommandEncoder> ETMetalStream::getComputeCommandEncoder() {
+    @autoreleasepool {
+        id<MTLCommandBuffer> commandBuffer = getCommandBuffer();
+        if (!commandBuffer) {
+            ET_LOG(Error, "ETMetalStream::getComputeCommandEncoder: Failed to get command buffer");
+            return nil;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        if (!encoder) {
+            ET_LOG(Error, "ETMetalStream::getComputeCommandEncoder: Failed to create compute command encoder");
+            return nil;
+        }
+
+        ET_LOG(Debug, "ETMetalStream::getComputeCommandEncoder: Created encoder %p from command buffer %p", encoder, commandBuffer);
+        return encoder;
+    }
+}
+
+void ETMetalStream::endEncoding(id<MTLComputeCommandEncoder> encoder) {
+    @autoreleasepool {
+        if (!encoder) {
+            ET_LOG(Error, "ETMetalStream::endEncoding: null encoder");
+            return;
+        }
+
+        [encoder endEncoding];
+
+        id<MTLCommandBuffer> commandBuffer = [encoder commandBuffer];
+        if (commandBuffer) {
+            commitCommandBuffer(commandBuffer);
+        }
+
+        ET_LOG(Debug, "ETMetalStream::endEncoding: Ended encoding for encoder %p", encoder);
+    }
+}
+
+void ETMetalStream::synchronize() {
+    @autoreleasepool {
+        ET_LOG(Debug, "ETMetalStream::synchronize: Synchronizing %zu active command buffers", activeCommandBuffers_.size());
+
+        for (auto& commandBuffer : activeCommandBuffers_) {
+            if (commandBuffer) {
+                [commandBuffer waitUntilCompleted];
+                [commandBuffer release];
+            }
+        }
+
+        activeCommandBuffers_.clear();
+
+        ET_LOG(Debug, "ETMetalStream::synchronize: Synchronization complete");
+    }
+}
+
+void ETMetalStream::flush() {
+    @autoreleasepool {
+        // Clean up completed command buffers to prevent memory growth
+        auto it = std::remove_if(activeCommandBuffers_.begin(), activeCommandBuffers_.end(),
+            [](id<MTLCommandBuffer> commandBuffer) {
+                if (!commandBuffer) {
+                    return true; // Remove null entries
+                }
+
+                MTLCommandBufferStatus status = [commandBuffer status];
+                if (status == MTLCommandBufferStatusCompleted ||
+                    status == MTLCommandBufferStatusError) {
+                    [commandBuffer release];
+                    return true;
+                }
+                return false;
+            });
+
+        size_t removedCount = activeCommandBuffers_.end() - it;
+        activeCommandBuffers_.erase(it, activeCommandBuffers_.end());
+
+        if (removedCount > 0) {
+            ET_LOG(Debug, "ETMetalStream::flush: Cleaned up %zu completed command buffers", removedCount);
+        }
+    }
+}
+
+bool ETMetalStream::isEmpty() const {
+    return activeCommandBuffers_.empty();
+}
+
+// =======================
+// Global Storage Management Functions
+// =======================
+
 void storeFunctionHandle(ETMetalKernelFunction* raw_function, std::shared_ptr<ETMetalKernelFunction> function_shared_ptr) {
     function_storage[raw_function] = function_shared_ptr;
 }
@@ -400,6 +684,21 @@ bool removeLibraryHandle(ETMetalShaderLibrary* raw_library) {
         return true;
     }
     return false;
+}
+
+// =======================
+// Global Stream Access Functions
+// =======================
+
+ETMetalStream* getCurrentMetalStream() {
+    if (!currentStream_) {
+        currentStream_ = ETMetalStream::getDefaultStream();
+    }
+    return currentStream_;
+}
+
+void setCurrentMetalStream(ETMetalStream* stream) {
+    currentStream_ = stream;
 }
 
 } // namespace aoti

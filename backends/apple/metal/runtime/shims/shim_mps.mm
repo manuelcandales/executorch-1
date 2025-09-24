@@ -12,9 +12,7 @@
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include "shim_mps.h"
-#include "et_metal_shim.h"
-#include "et_metal_stream.h"
-#include "metal_helper.h"
+#include "et_metal.h"
 #include "utils.h"
 #include "memory.h"
 #include <functional>
