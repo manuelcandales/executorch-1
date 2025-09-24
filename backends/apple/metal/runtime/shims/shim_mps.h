@@ -56,6 +56,30 @@ AOTITorchError aoti_torch_mps_set_arg_int(
     unsigned idx,
     int64_t val);
 
+// Pure C dispatch functions - single value versions
+AOTITorchError aoti_torch_mps_dispatch_single(
+    AOTIMetalKernelFunctionHandle func,
+    uint64_t length);
+
+AOTITorchError aoti_torch_mps_dispatch_single_with_group_size(
+    AOTIMetalKernelFunctionHandle func,
+    uint64_t length,
+    uint64_t group_size);
+
+// Pure C dispatch functions - array versions
+AOTITorchError aoti_torch_mps_dispatch_array(
+    AOTIMetalKernelFunctionHandle func,
+    const uint64_t* length,
+    size_t length_size);
+
+AOTITorchError aoti_torch_mps_dispatch_array_with_group_size(
+    AOTIMetalKernelFunctionHandle func,
+    const uint64_t* length,
+    size_t length_size,
+    const uint64_t* group_size,
+    size_t group_size_size);
+
+// Memory management functions
 AOTITorchError aoti_torch_mps_malloc(void** buffer, size_t num_bytes);
 
 AOTITorchError aoti_torch_mps_free(void* ptr);
@@ -79,20 +103,12 @@ AOTITorchError aoti_torch_mps_synchronize_stream();
 #ifdef __cplusplus
 } // extern "C"
 
-// C++ only functions that can use std::function and C++ types
+// C++ only functions that can use std::function
 #include <functional>
-#include <c10/util/ArrayRef.h>
-#include <c10/util/OptionalArrayRef.h>
 
 AOTITorchError aoti_torch_mps_run_command_block(
     AOTIMetalKernelFunctionHandle func,
     std::function<void(AOTIMetalKernelFunctionHandle)> command_block);
-
-// Single dispatch function that handles both cases
-AOTITorchError aoti_torch_mps_dispatch(
-    AOTIMetalKernelFunctionHandle func,
-    c10::ArrayRef<uint64_t> length,
-    c10::OptionalArrayRef<uint64_t> groupSize = std::nullopt);
 
 // Legacy operation-specific functions (preserved for backward compatibility)
 AOTITorchError aoti_torch_mps_addmm_out(
