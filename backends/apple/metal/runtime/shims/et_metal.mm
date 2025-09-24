@@ -632,7 +632,7 @@ void ETMetalStream::synchronize(SyncType syncType) {
                     if (enableCommitAndContinue_) {
                         commitAndContinue();
                     } else {
-                        ET_LOG(Warning, "ETMetalStream::synchronize: CommitAndContinue requested but disabled");
+                        ET_LOG(Error, "ETMetalStream::synchronize: CommitAndContinue requested but disabled");
                         commit();
                     }
                     break;
@@ -688,7 +688,7 @@ void ETMetalStream::commitAndWait() {
 
 void ETMetalStream::commitAndContinue() {
     if (!commandBuffer_) {
-        ET_LOG(Warning, "ETMetalStream::commitAndContinue: No command buffer to commit");
+        ET_LOG(Error, "ETMetalStream::commitAndContinue: No command buffer to commit");
         return;
     }
 

@@ -8,14 +8,28 @@
 
 #pragma once
 
+#ifdef __OBJC__
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#include <dispatch/dispatch.h>
+#else
+// Forward declarations for C++ compilation
+typedef void* MTLDevice_t;
+typedef void* MTLCommandQueue_t;
+typedef void* MTLCommandBuffer_t;
+typedef void* MTLComputeCommandEncoder_t;
+typedef void* MTLComputePipelineState_t;
+typedef void* MTLFunction_t;
+typedef void* MTLLibrary_t;
+typedef void* MTLBuffer_t;
+typedef void* dispatch_queue_t;
+#endif
+
 #include <unordered_map>
 #include <memory>
 #include <string>
 #include <functional>
 #include <vector>
-#include <dispatch/dispatch.h>
 
 namespace executorch {
 namespace runtime {
@@ -56,13 +70,23 @@ public:
 
 private:
     void compileLibrary();
+#ifdef __OBJC__
     std::pair<id<MTLComputePipelineState>, id<MTLFunction>> getLibraryPipelineState(const std::string& functionName);
 
     friend class ETMetalKernelFunction;
 
     std::string shaderSource_;
-    id<MTLLibrary> library_ = nil;
+    id<MTLLibrary> library_;
     std::unordered_map<std::string, std::pair<id<MTLComputePipelineState>, id<MTLFunction>>> pipelineStates_;
+#else
+    void* getLibraryPipelineState(const std::string& functionName);
+
+    friend class ETMetalKernelFunction;
+
+    std::string shaderSource_;
+    void* library_;
+    std::unordered_map<std::string, void*> pipelineStates_;
+#endif
 };
 
 // =======================
@@ -70,7 +94,11 @@ private:
 // =======================
 class ETMetalKernelFunction {
 public:
+#ifdef __OBJC__
     ETMetalKernelFunction(id<MTLComputePipelineState> cps, id<MTLFunction> func);
+#else
+    ETMetalKernelFunction(void* cps, void* func);
+#endif
     ~ETMetalKernelFunction();
 
     void startEncoding();
@@ -87,9 +115,15 @@ public:
     void endEncoding();
 
 private:
+#ifdef __OBJC__
     id<MTLComputePipelineState> cps_;
     id<MTLFunction> func_;
     id<MTLComputeCommandEncoder> encoder_;
+#else
+    void* cps_;
+    void* func_;
+    void* encoder_;
+#endif
 };
 
 // =======================
@@ -103,6 +137,7 @@ public:
     // Get the default stream (singleton)
     static ETMetalStream* getDefaultStream();
 
+#ifdef __OBJC__
     // Device and queue access
     id<MTLDevice> device() const { return device_; }
     id<MTLCommandQueue> commandQueue() const { return commandQueue_; }
@@ -114,9 +149,11 @@ public:
 
     // Synchronization methods
     void synchronize(SyncType syncType = SyncType::COMMIT_AND_WAIT);
+    void synchronize(); // Overload for backward compatibility
     void endKernelCoalescing();
 
     // Command buffer lifecycle management
+    id<MTLCommandBuffer> getCommandBuffer(); // Legacy compatibility method
     void commitCommandBuffer(id<MTLCommandBuffer> commandBuffer);
     void flush();
     bool isEmpty() const;
@@ -149,6 +186,29 @@ private:
     void commit();
     void commitAndWait();
     void commitAndContinue();
+#else
+    // C++ only interface - limited functionality
+    void* device() const { return device_; }
+    void* commandQueue() const { return commandQueue_; }
+    void* queue() const { return serialQueue_; }
+
+    // Basic methods for C++ compilation
+    void synchronize(SyncType syncType = SyncType::COMMIT_AND_WAIT);
+    void synchronize();
+    bool isEmpty() const;
+
+private:
+    // Private members (void* for C++ compatibility)
+    void* device_;
+    void* commandQueue_;
+    void* commandBuffer_;
+    void* prevCommandBuffer_;
+    void* commandEncoder_;
+    void* serialQueue_;
+
+    // Configuration
+    bool enableCommitAndContinue_;
+#endif
 
     // Singleton instance
     static ETMetalStream* defaultStream_;
@@ -184,10 +244,13 @@ void metal_cleanup_resources();
 bool metal_is_device_pointer(void* ptr);
 int metal_copy_memory(void* dst, const void* src, size_t nbytes, bool src_is_device, bool dst_is_device);
 
+// Helper functions to access Metal objects
 #ifdef __OBJC__
-// Helper functions to access Metal objects (Objective-C only)
 id<MTLDevice> get_metal_device();
 id<MTLCommandQueue> get_metal_command_queue();
+#else
+void* get_metal_device();
+void* get_metal_command_queue();
 #endif
 
 #ifdef __cplusplus
