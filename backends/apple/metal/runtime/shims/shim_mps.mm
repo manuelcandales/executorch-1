@@ -14,11 +14,371 @@
 #include "shim_mps.h"
 #include "metal_helper.h"
 #include "utils.h"
-#include "memory.h"  // For tensors and is_tensor_own_memory globals
+#include "memory.h"
+#include <unordered_map>
+#include <memory>
+#include <string>
+#include <functional>
+
+// ExecuTorch-specific C++ headers (if c10 headers aren't available, we'll provide minimal compatibility)
+#ifndef C10_UTIL_ARRAYREF_H_
+// Minimal ArrayRef compatibility for ExecuTorch
+namespace c10 {
+template<typename T>
+class ArrayRef {
+public:
+    ArrayRef() : data_(nullptr), size_(0) {}
+    ArrayRef(const T* data, size_t size) : data_(data), size_(size) {}
+    ArrayRef(const std::vector<T>& vec) : data_(vec.data()), size_(vec.size()) {}
+
+    const T* data() const { return data_; }
+    size_t size() const { return size_; }
+    const T& operator[](size_t i) const { return data_[i]; }
+
+private:
+    const T* data_;
+    size_t size_;
+};
+
+template<typename T>
+class OptionalArrayRef {
+public:
+    OptionalArrayRef() : has_value_(false) {}
+    OptionalArrayRef(std::nullopt_t) : has_value_(false) {}
+    OptionalArrayRef(ArrayRef<T> ref) : has_value_(true), value_(ref) {}
+
+    bool has_value() const { return has_value_; }
+    const ArrayRef<T>& value() const { return value_; }
+
+private:
+    bool has_value_;
+    ArrayRef<T> value_;
+};
+}
+#else
+#include <c10/util/ArrayRef.h>
+#include <c10/util/OptionalArrayRef.h>
+#endif
 
 namespace executorch {
 namespace backends {
 namespace aoti {
+
+// ExecuTorch MetalShaderLibrary equivalent - simplified version of PyTorch's implementation
+class ETMetalShaderLibrary {
+public:
+    ETMetalShaderLibrary(const std::string& source) : shaderSource_(source) {
+        compileLibrary();
+    }
+
+    ~ETMetalShaderLibrary() {
+        if (library_) {
+            [library_ release];
+            library_ = nil;
+        }
+
+        // Clean up pipeline states
+        for (auto& pair : pipelineStates_) {
+            [pair.second.first release];  // MTLComputePipelineState
+            [pair.second.second release]; // MTLFunction
+        }
+        pipelineStates_.clear();
+    }
+
+    std::shared_ptr<class ETMetalKernelFunction> getKernelFunction(const std::string& name);
+
+private:
+    void compileLibrary() {
+        @autoreleasepool {
+            id<MTLDevice> device = get_metal_device();
+            if (!device) {
+                ET_LOG(Error, "ETMetalShaderLibrary: Failed to get Metal device");
+                return;
+            }
+
+            NSString* sourceString = [NSString stringWithUTF8String:shaderSource_.c_str()];
+            NSError* error = nil;
+
+            library_ = [device newLibraryWithSource:sourceString options:nil error:&error];
+            if (!library_ || error) {
+                ET_LOG(Error, "ETMetalShaderLibrary: Failed to compile shader library: %s",
+                       error ? [[error localizedDescription] UTF8String] : "unknown error");
+                return;
+            }
+
+            [library_ retain];
+            ET_LOG(Debug, "ETMetalShaderLibrary: Successfully compiled shader library");
+        }
+    }
+
+    std::pair<id<MTLComputePipelineState>, id<MTLFunction>> getLibraryPipelineState(const std::string& functionName) {
+        auto it = pipelineStates_.find(functionName);
+        if (it != pipelineStates_.end()) {
+            return it->second;
+        }
+
+        @autoreleasepool {
+            if (!library_) {
+                ET_LOG(Error, "ETMetalShaderLibrary: Library not compiled");
+                return {nil, nil};
+            }
+
+            id<MTLDevice> device = get_metal_device();
+            if (!device) {
+                ET_LOG(Error, "ETMetalShaderLibrary: Failed to get Metal device");
+                return {nil, nil};
+            }
+
+            NSString* funcName = [NSString stringWithUTF8String:functionName.c_str()];
+            id<MTLFunction> function = [library_ newFunctionWithName:funcName];
+            if (!function) {
+                ET_LOG(Error, "ETMetalShaderLibrary: Failed to get function '%s'", functionName.c_str());
+                return {nil, nil};
+            }
+
+            NSError* error = nil;
+            id<MTLComputePipelineState> pipelineState = [device newComputePipelineStateWithFunction:function error:&error];
+            if (!pipelineState || error) {
+                ET_LOG(Error, "ETMetalShaderLibrary: Failed to create pipeline state for '%s': %s",
+                       functionName.c_str(), error ? [[error localizedDescription] UTF8String] : "unknown error");
+                [function release];
+                return {nil, nil};
+            }
+
+            // Retain objects and store in cache
+            [pipelineState retain];
+            [function retain];
+            pipelineStates_[functionName] = {pipelineState, function};
+
+            ET_LOG(Debug, "ETMetalShaderLibrary: Created pipeline state for function '%s'", functionName.c_str());
+            return {pipelineState, function};
+        }
+    }
+
+    friend class ETMetalKernelFunction;
+
+    std::string shaderSource_;
+    id<MTLLibrary> library_ = nil;
+    std::unordered_map<std::string, std::pair<id<MTLComputePipelineState>, id<MTLFunction>>> pipelineStates_;
+};
+
+// ExecuTorch MetalKernelFunction equivalent - simplified version of PyTorch's implementation
+class ETMetalKernelFunction {
+public:
+    ETMetalKernelFunction(id<MTLComputePipelineState> cps, id<MTLFunction> func)
+        : cps_(cps), func_(func), encoder_(nil) {
+        if (cps_) [cps_ retain];
+        if (func_) [func_ retain];
+    }
+
+    ~ETMetalKernelFunction() {
+        if (encoder_) {
+            [encoder_ release];
+            encoder_ = nil;
+        }
+        if (cps_) {
+            [cps_ release];
+            cps_ = nil;
+        }
+        if (func_) {
+            [func_ release];
+            func_ = nil;
+        }
+    }
+
+    void startEncoding() {
+        @autoreleasepool {
+            if (encoder_) {
+                [encoder_ release];
+                encoder_ = nil;
+            }
+
+            id<MTLCommandQueue> commandQueue = get_metal_command_queue();
+            if (!commandQueue) {
+                ET_LOG(Error, "ETMetalKernelFunction: Failed to get command queue");
+                return;
+            }
+
+            id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+            if (!commandBuffer) {
+                ET_LOG(Error, "ETMetalKernelFunction: Failed to create command buffer");
+                return;
+            }
+
+            encoder_ = [commandBuffer computeCommandEncoder];
+            if (!encoder_) {
+                ET_LOG(Error, "ETMetalKernelFunction: Failed to create compute command encoder");
+                return;
+            }
+
+            [encoder_ retain];
+            [encoder_ setComputePipelineState:cps_];
+
+            ET_LOG(Debug, "ETMetalKernelFunction: Started encoding");
+        }
+    }
+
+    void setArg(unsigned idx, const executorch::runtime::etensor::Tensor& tensor) {
+        if (!encoder_) {
+            ET_LOG(Error, "ETMetalKernelFunction::setArg: No active encoder");
+            return;
+        }
+
+        void* data_ptr = tensor.mutable_data_ptr();
+
+        // Check if this is a Metal buffer or CPU tensor
+        auto it = ptr_to_mtl_buffer.find(data_ptr);
+        if (it != ptr_to_mtl_buffer.end()) {
+            // This tensor data lives in a Metal buffer
+            id<MTLBuffer> mtlBuffer = it->second;
+            [encoder_ setBuffer:mtlBuffer offset:0 atIndex:idx];
+            ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set Metal buffer at index %u", idx);
+        } else {
+            // CPU tensor - use setBytes for small data or create temporary buffer for large data
+            size_t totalSize = tensor.numel() * tensor.element_size();
+            if (totalSize <= 4096) {
+                [encoder_ setBytes:data_ptr length:totalSize atIndex:idx];
+                ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set CPU tensor via setBytes at index %u", idx);
+            } else {
+                // Create temporary buffer for large data
+                id<MTLDevice> device = get_metal_device();
+                id<MTLBuffer> tempBuffer = [device newBufferWithBytes:data_ptr length:totalSize options:MTLResourceStorageModeShared];
+                [encoder_ setBuffer:tempBuffer offset:0 atIndex:idx];
+                ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set large CPU tensor via temporary buffer at index %u", idx);
+            }
+        }
+    }
+
+    void setArg(unsigned idx, int64_t val) {
+        if (!encoder_) {
+            ET_LOG(Error, "ETMetalKernelFunction::setArg: No active encoder");
+            return;
+        }
+
+        [encoder_ setBytes:&val length:sizeof(int64_t) atIndex:idx];
+        ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set int64_t value %lld at index %u", val, idx);
+    }
+
+    void setArg(unsigned idx, const void* ptr, uint64_t size) {
+        if (!encoder_) {
+            ET_LOG(Error, "ETMetalKernelFunction::setArg: No active encoder");
+            return;
+        }
+
+        [encoder_ setBytes:ptr length:size atIndex:idx];
+        ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set bytes at index %u, size %llu", idx, size);
+    }
+
+    void dispatch(uint64_t length, std::optional<uint64_t> groupSize = std::nullopt) {
+        if (!encoder_) {
+            ET_LOG(Error, "ETMetalKernelFunction::dispatch: No active encoder");
+            return;
+        }
+
+        const auto maxThreadsPerGroup = [cps_ maxTotalThreadsPerThreadgroup];
+        uint64_t actualGroupSize = groupSize.value_or(std::min(maxThreadsPerGroup, length));
+
+        auto size = MTLSizeMake(length, 1, 1);
+        auto threadGroupSize = MTLSizeMake(actualGroupSize, 1, 1);
+
+        [encoder_ dispatchThreads:size threadsPerThreadgroup:threadGroupSize];
+        ET_LOG(Debug, "ETMetalKernelFunction::dispatch: Dispatched with length %llu, group size %llu", length, actualGroupSize);
+    }
+
+    void dispatch(c10::ArrayRef<uint64_t> length, c10::OptionalArrayRef<uint64_t> groupSize = std::nullopt) {
+        if (!encoder_) {
+            ET_LOG(Error, "ETMetalKernelFunction::dispatch: No active encoder");
+            return;
+        }
+
+        if (length.size() == 0) {
+            ET_LOG(Error, "ETMetalKernelFunction::dispatch: Empty length array");
+            return;
+        }
+
+        const auto maxThreadsPerGroup = [cps_ maxTotalThreadsPerThreadgroup];
+
+        // Handle 1D, 2D, and 3D dispatch
+        MTLSize size, threadGroupSize;
+
+        if (length.size() == 1) {
+            size = MTLSizeMake(length[0], 1, 1);
+            uint64_t actualGroupSize = maxThreadsPerGroup;
+            if (groupSize.has_value() && groupSize.value().size() > 0) {
+                actualGroupSize = std::min(maxThreadsPerGroup, groupSize.value()[0]);
+            }
+            threadGroupSize = MTLSizeMake(actualGroupSize, 1, 1);
+        } else if (length.size() == 2) {
+            size = MTLSizeMake(length[0], length[1], 1);
+            uint64_t groupX = std::min(static_cast<uint64_t>(32), length[0]);
+            uint64_t groupY = maxThreadsPerGroup / groupX;
+            if (groupSize.has_value() && groupSize.value().size() >= 2) {
+                groupX = std::min(static_cast<uint64_t>(groupSize.value()[0]), length[0]);
+                groupY = std::min(static_cast<uint64_t>(groupSize.value()[1]), length[1]);
+            }
+            threadGroupSize = MTLSizeMake(groupX, groupY, 1);
+        } else { // 3D or higher - treat as 3D
+            size = MTLSizeMake(length[0], length[1], length.size() > 2 ? length[2] : 1);
+            uint64_t groupX = std::min(static_cast<uint64_t>(8), length[0]);
+            uint64_t groupY = std::min(static_cast<uint64_t>(8), length[1]);
+            uint64_t groupZ = maxThreadsPerGroup / (groupX * groupY);
+            if (groupSize.has_value() && groupSize.value().size() >= 3) {
+                groupX = std::min(static_cast<uint64_t>(groupSize.value()[0]), length[0]);
+                groupY = std::min(static_cast<uint64_t>(groupSize.value()[1]), length[1]);
+                groupZ = std::min(static_cast<uint64_t>(groupSize.value()[2]), length.size() > 2 ? length[2] : 1);
+            }
+            threadGroupSize = MTLSizeMake(groupX, groupY, groupZ);
+        }
+
+        [encoder_ dispatchThreads:size threadsPerThreadgroup:threadGroupSize];
+        ET_LOG(Debug, "ETMetalKernelFunction::dispatch: Dispatched %luD with size [%lu, %lu, %lu], group [%lu, %lu, %lu]",
+               length.size(), size.width, size.height, size.depth,
+               threadGroupSize.width, threadGroupSize.height, threadGroupSize.depth);
+    }
+
+    void runCommandBlock(std::function<void(void)> f) {
+        @autoreleasepool {
+            if (!encoder_) {
+                ET_LOG(Error, "ETMetalKernelFunction::runCommandBlock: No active encoder");
+                return;
+            }
+
+            // Execute the command block
+            f();
+
+            // End encoding and commit
+            [encoder_ endEncoding];
+
+            id<MTLCommandBuffer> commandBuffer = [encoder_ commandBuffer];
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+
+            ET_LOG(Debug, "ETMetalKernelFunction::runCommandBlock: Executed command block");
+        }
+    }
+
+    // Accessor for encoder (needed by shim functions)
+    id<MTLComputeCommandEncoder> getEncoder() const { return encoder_; }
+
+private:
+    id<MTLComputePipelineState> cps_;
+    id<MTLFunction> func_;
+    id<MTLComputeCommandEncoder> encoder_;
+};
+
+std::shared_ptr<ETMetalKernelFunction> ETMetalShaderLibrary::getKernelFunction(const std::string& name) {
+    auto pipelineStatePair = getLibraryPipelineState(name);
+    if (!pipelineStatePair.first || !pipelineStatePair.second) {
+        ET_LOG(Error, "ETMetalShaderLibrary::getKernelFunction: Failed to get pipeline state for '%s'", name.c_str());
+        return nullptr;
+    }
+
+    return std::make_shared<ETMetalKernelFunction>(pipelineStatePair.first, pipelineStatePair.second);
+}
+
+// Global storage to keep shared_ptr alive while raw pointers are used (matching PyTorch pattern)
+static std::unordered_map<ETMetalKernelFunction*, std::shared_ptr<ETMetalKernelFunction>> function_storage;
+static std::unordered_map<ETMetalShaderLibrary*, std::unique_ptr<ETMetalShaderLibrary>> library_storage;
 
 // We need to match PyTorch's MetalKernelFunction structure to extract the encoder
 // This is based on PyTorch's ATen/native/mps/MetalShaderLibrary.h
@@ -33,6 +393,306 @@ namespace {
 }
 
 extern "C" {
+
+// MetalShaderLibrary functions
+AOTITorchError aoti_torch_mps_create_shader_library(
+    const char* metal_shader_source,
+    AOTIMetalShaderLibraryHandle* library_handle) {
+
+    if (!metal_shader_source || !library_handle) {
+        ET_LOG(Error, "aoti_torch_mps_create_shader_library: null arguments");
+        return Error::InvalidArgument;
+    }
+
+    @autoreleasepool {
+        try {
+            auto library = std::make_unique<ETMetalShaderLibrary>(std::string(metal_shader_source));
+            auto* raw_library = library.get();
+
+            // Store the unique_ptr to keep the object alive
+            library_storage[raw_library] = std::move(library);
+
+            // Return raw pointer to match existing API
+            *library_handle = reinterpret_cast<AOTIMetalShaderLibraryHandle>(raw_library);
+
+            ET_LOG(Debug, "aoti_torch_mps_create_shader_library: Created shader library %p", raw_library);
+            return Error::Ok;
+
+        } catch (const std::exception& e) {
+            ET_LOG(Error, "aoti_torch_mps_create_shader_library exception: %s", e.what());
+            return Error::Internal;
+        } catch (...) {
+            ET_LOG(Error, "aoti_torch_mps_create_shader_library: unknown exception");
+            return Error::Internal;
+        }
+    }
+}
+
+AOTITorchError aoti_torch_mps_delete_shader_library(
+    AOTIMetalShaderLibraryHandle library_handle) {
+
+    if (!library_handle) {
+        ET_LOG(Error, "aoti_torch_mps_delete_shader_library: null library handle");
+        return Error::InvalidArgument;
+    }
+
+    try {
+        auto* library = reinterpret_cast<ETMetalShaderLibrary*>(library_handle);
+        auto it = library_storage.find(library);
+        if (it != library_storage.end()) {
+            library_storage.erase(it);
+            ET_LOG(Debug, "aoti_torch_mps_delete_shader_library: Deleted shader library %p", library);
+        } else {
+            ET_LOG(Error, "aoti_torch_mps_delete_shader_library: Library not found in storage");
+            return Error::InvalidArgument;
+        }
+
+        return Error::Ok;
+
+    } catch (const std::exception& e) {
+        ET_LOG(Error, "aoti_torch_mps_delete_shader_library exception: %s", e.what());
+        return Error::Internal;
+    } catch (...) {
+        ET_LOG(Error, "aoti_torch_mps_delete_shader_library: unknown exception");
+        return Error::Internal;
+    }
+}
+
+AOTITorchError aoti_torch_mps_get_kernel_function(
+    AOTIMetalShaderLibraryHandle library_handle,
+    const char* kernel_name,
+    AOTIMetalKernelFunctionHandle* function_handle) {
+
+    if (!library_handle || !kernel_name || !function_handle) {
+        ET_LOG(Error, "aoti_torch_mps_get_kernel_function: null arguments");
+        return Error::InvalidArgument;
+    }
+
+    try {
+        auto* library = reinterpret_cast<ETMetalShaderLibrary*>(library_handle);
+        auto function_shared_ptr = library->getKernelFunction(std::string(kernel_name));
+        if (!function_shared_ptr) {
+            ET_LOG(Error, "aoti_torch_mps_get_kernel_function: Failed to get kernel function '%s'", kernel_name);
+            return Error::Internal;
+        }
+
+        auto* raw_function = function_shared_ptr.get();
+
+        // Store the shared_ptr to keep the object alive
+        function_storage[raw_function] = function_shared_ptr;
+
+        // Return raw pointer to match existing API
+        *function_handle = reinterpret_cast<AOTIMetalKernelFunctionHandle>(raw_function);
+
+        ET_LOG(Debug, "aoti_torch_mps_get_kernel_function: Got kernel function '%s' -> %p", kernel_name, raw_function);
+        return Error::Ok;
+
+    } catch (const std::exception& e) {
+        ET_LOG(Error, "aoti_torch_mps_get_kernel_function exception: %s", e.what());
+        return Error::Internal;
+    } catch (...) {
+        ET_LOG(Error, "aoti_torch_mps_get_kernel_function: unknown exception");
+        return Error::Internal;
+    }
+}
+
+// MetalKernelFunction functions
+AOTITorchError aoti_torch_mps_start_encoding(
+    AOTIMetalKernelFunctionHandle func) {
+
+    if (!func) {
+        ET_LOG(Error, "aoti_torch_mps_start_encoding: null function handle");
+        return Error::InvalidArgument;
+    }
+
+    try {
+        auto* function = reinterpret_cast<ETMetalKernelFunction*>(func);
+        function->startEncoding();
+
+        ET_LOG(Debug, "aoti_torch_mps_start_encoding: Started encoding for function %p", function);
+        return Error::Ok;
+
+    } catch (const std::exception& e) {
+        ET_LOG(Error, "aoti_torch_mps_start_encoding exception: %s", e.what());
+        return Error::Internal;
+    } catch (...) {
+        ET_LOG(Error, "aoti_torch_mps_start_encoding: unknown exception");
+        return Error::Internal;
+    }
+}
+
+AOTITorchError aoti_torch_mps_malloc(void** buffer, size_t num_bytes) {
+    if (num_bytes == 0) {
+        *buffer = nullptr;
+        return Error::Ok;
+    }
+
+    if (!buffer) {
+        ET_LOG(Error, "aoti_torch_mps_malloc: null buffer pointer");
+        return Error::InvalidArgument;
+    }
+
+    @autoreleasepool {
+        try {
+            id<MTLDevice> device = get_metal_device();
+            if (!device) {
+                ET_LOG(Error, "aoti_torch_mps_malloc: Failed to get Metal device");
+                return Error::Internal;
+            }
+
+            id<MTLBuffer> metal_buffer = [device newBufferWithLength:num_bytes
+                                                             options:MTLResourceCPUCacheModeWriteCombined | MTLResourceStorageModeShared];
+            if (!metal_buffer) {
+                ET_LOG(Error, "aoti_torch_mps_malloc: Failed to allocate Metal buffer of size %zu", num_bytes);
+                return Error::Internal;
+            }
+
+            *buffer = (void*)metal_buffer;
+            ET_LOG(Debug, "aoti_torch_mps_malloc: Allocated Metal buffer %p of size %zu", metal_buffer, num_bytes);
+            return Error::Ok;
+
+        } catch (const std::exception& e) {
+            ET_LOG(Error, "aoti_torch_mps_malloc exception: %s", e.what());
+            return Error::Internal;
+        } catch (...) {
+            ET_LOG(Error, "aoti_torch_mps_malloc: unknown exception");
+            return Error::Internal;
+        }
+    }
+}
+
+AOTITorchError aoti_torch_mps_free(void* ptr) {
+    if (!ptr) {
+        return Error::Ok;  // Nothing to free
+    }
+
+    @autoreleasepool {
+        try {
+            auto metal_buffer = (id<MTLBuffer>)ptr;
+            [metal_buffer release];
+
+            ET_LOG(Debug, "aoti_torch_mps_free: Freed Metal buffer %p", ptr);
+            return Error::Ok;
+
+        } catch (const std::exception& e) {
+            ET_LOG(Error, "aoti_torch_mps_free exception: %s", e.what());
+            return Error::Internal;
+        } catch (...) {
+            ET_LOG(Error, "aoti_torch_mps_free: unknown exception");
+            return Error::Internal;
+        }
+    }
+}
+
+AOTITorchError aoti_torch_mps_memcpy(
+    void* buffer,
+    size_t constant_offset,
+    size_t bytes_read,
+    size_t data_size,
+    uint8_t* constants_start) {
+
+    if (!buffer || !constants_start) {
+        ET_LOG(Error, "aoti_torch_mps_memcpy: null buffer or constants_start");
+        return Error::InvalidArgument;
+    }
+
+    @autoreleasepool {
+        try {
+            auto metal_buffer = (id<MTLBuffer>)buffer;
+            auto buffer_pointer = static_cast<uint8_t*>([metal_buffer contents]);
+
+            if (!buffer_pointer) {
+                ET_LOG(Error, "aoti_torch_mps_memcpy: Failed to get buffer contents");
+                return Error::Internal;
+            }
+
+            memcpy(buffer_pointer + constant_offset, constants_start + bytes_read, data_size);
+
+            ET_LOG(Debug, "aoti_torch_mps_memcpy: Copied %zu bytes from offset %zu to buffer offset %zu",
+                   data_size, bytes_read, constant_offset);
+            return Error::Ok;
+
+        } catch (const std::exception& e) {
+            ET_LOG(Error, "aoti_torch_mps_memcpy exception: %s", e.what());
+            return Error::Internal;
+        } catch (...) {
+            ET_LOG(Error, "aoti_torch_mps_memcpy: unknown exception");
+            return Error::Internal;
+        }
+    }
+}
+
+AOTITorchError aoti_torch_mps_copy_buffer(
+    void* src_buffer,
+    void* dst_buffer,
+    size_t data_size,
+    size_t src_offset,
+    size_t dst_offset) {
+
+    if (!src_buffer || !dst_buffer) {
+        ET_LOG(Error, "aoti_torch_mps_copy_buffer: null buffer");
+        return Error::InvalidArgument;
+    }
+
+    @autoreleasepool {
+        try {
+            auto src_mtl_buffer = (id<MTLBuffer>)src_buffer;
+            auto dst_mtl_buffer = (id<MTLBuffer>)dst_buffer;
+
+            // For simplicity, use CPU-side memory copy
+            // In a full implementation, you might want to use GPU-side copy via Metal command encoder
+            uint8_t* src_contents = static_cast<uint8_t*>([src_mtl_buffer contents]);
+            uint8_t* dst_contents = static_cast<uint8_t*>([dst_mtl_buffer contents]);
+
+            if (!src_contents || !dst_contents) {
+                ET_LOG(Error, "aoti_torch_mps_copy_buffer: Failed to get buffer contents");
+                return Error::Internal;
+            }
+
+            memcpy(dst_contents + dst_offset, src_contents + src_offset, data_size);
+
+            ET_LOG(Debug, "aoti_torch_mps_copy_buffer: Copied %zu bytes from src+%zu to dst+%zu",
+                   data_size, src_offset, dst_offset);
+            return Error::Ok;
+
+        } catch (const std::exception& e) {
+            ET_LOG(Error, "aoti_torch_mps_copy_buffer exception: %s", e.what());
+            return Error::Internal;
+        } catch (...) {
+            ET_LOG(Error, "aoti_torch_mps_copy_buffer: unknown exception");
+            return Error::Internal;
+        }
+    }
+}
+
+AOTITorchError aoti_torch_mps_synchronize_stream() {
+    @autoreleasepool {
+        try {
+            // For ExecuTorch, we'll use simple synchronous execution
+            // In a full implementation, you might want to implement proper stream synchronization
+            id<MTLCommandQueue> commandQueue = get_metal_command_queue();
+            if (!commandQueue) {
+                ET_LOG(Error, "aoti_torch_mps_synchronize_stream: Failed to get command queue");
+                return Error::Internal;
+            }
+
+            // Create a dummy command buffer and wait for it to complete to ensure synchronization
+            id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+
+            ET_LOG(Debug, "aoti_torch_mps_synchronize_stream: Stream synchronized");
+            return Error::Ok;
+
+        } catch (const std::exception& e) {
+            ET_LOG(Error, "aoti_torch_mps_synchronize_stream exception: %s", e.what());
+            return Error::Internal;
+        } catch (...) {
+            ET_LOG(Error, "aoti_torch_mps_synchronize_stream: unknown exception");
+            return Error::Internal;
+        }
+    }
+}
 
 AOTITorchError aoti_torch_mps_set_arg_tensor(
     AOTIMetalKernelFunctionHandle func,
@@ -435,21 +1095,44 @@ AOTITorchError aoti_torch_mps_convolution(
       // Zero out the allocated memory
       std::memset(tensor_data, 0, tensor_size_bytes);
 
-      // Create tensor using from_blob to ensure we have control over the memory
-      auto output_tensor = executorch::extension::from_blob(
+      // Create tensor using aoti_torch_create_tensor_from_blob_v2 to ensure we have control over the memory
+      // Convert sizes vector to int64_t array
+      std::vector<int64_t> output_sizes_int64 = {N, C_out, H_out, W_out};
+
+      // Calculate default strides for a contiguous tensor (NCHW format)
+      std::vector<int64_t> output_strides = {
+          C_out * H_out * W_out,  // Stride for N dimension
+          H_out * W_out,          // Stride for C dimension
+          W_out,                  // Stride for H dimension
+          1                       // Stride for W dimension
+      };
+
+      AtenTensorHandle output_tensor_handle = nullptr;
+
+      AOTITorchError create_result = aoti_torch_create_tensor_from_blob_v2(
           tensor_data,
-          output_sizes,
-          executorch::runtime::etensor::ScalarType::Float
+          4,  // ndim
+          output_sizes_int64.data(),
+          output_strides.data(),
+          0,  // storage_offset
+          static_cast<int32_t>(SupportedDTypes::FLOAT32),  // dtype
+          0,  // device_type (CPU)
+          0,  // device_index
+          &output_tensor_handle,
+          0,  // layout (strided)
+          nullptr,  // opaque_metadata
+          0   // opaque_metadata_size
       );
 
-      if (!output_tensor) {
-        ET_LOG(Error, "aoti_torch_mps_convolution: Failed to create output tensor");
+      if (create_result != Error::Ok || !output_tensor_handle) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Failed to create output tensor, error code: %d", static_cast<int>(create_result));
         std::free(tensor_data);  // Free the allocated memory on failure
         return Error::Internal;
       }
 
       // Verify the tensor was created with the correct size
-      size_t actual_numel = output_tensor->numel();
+      auto* et_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(output_tensor_handle);
+      size_t actual_numel = et_tensor->numel();
       ET_LOG(Debug, "aoti_torch_mps_convolution: Created tensor with actual numel = %zu", actual_numel);
 
       if (actual_numel != expected_numel) {
@@ -458,11 +1141,9 @@ AOTITorchError aoti_torch_mps_convolution(
         return Error::Internal;
       }
 
-      // Store the tensor so it doesn't get destroyed - mark that we own the memory
-      // since we manually allocated it with malloc
-      tensors.insert(output_tensor);
-      *ret0 = reinterpret_cast<AtenTensorHandle>(output_tensor.get());
-      is_tensor_own_memory[output_tensor.get()] = true;  // We allocated the memory manually
+      // Store the tensor handle - mark that we own the memory since we manually allocated it with malloc
+      *ret0 = output_tensor_handle;
+      is_tensor_own_memory[et_tensor] = true;  // We allocated the memory manually
 
       ET_LOG(Debug, "aoti_torch_mps_convolution: Created zero-filled output tensor with %zu elements", actual_numel);
       return Error::Ok;
@@ -478,6 +1159,61 @@ AOTITorchError aoti_torch_mps_convolution(
 }
 
 } // extern "C"
+
+// C++ only functions that can use std::function and C++ types
+AOTITorchError aoti_torch_mps_run_command_block(
+    AOTIMetalKernelFunctionHandle func,
+    std::function<void(AOTIMetalKernelFunctionHandle)> command_block) {
+
+    if (!func) {
+        ET_LOG(Error, "aoti_torch_mps_run_command_block: null function handle");
+        return Error::InvalidArgument;
+    }
+
+    try {
+        auto* function = reinterpret_cast<ETMetalKernelFunction*>(func);
+        function->runCommandBlock([&command_block, func]() {
+            command_block(func);
+        });
+
+        ET_LOG(Debug, "aoti_torch_mps_run_command_block: Executed command block for function %p", function);
+        return Error::Ok;
+
+    } catch (const std::exception& e) {
+        ET_LOG(Error, "aoti_torch_mps_run_command_block exception: %s", e.what());
+        return Error::Internal;
+    } catch (...) {
+        ET_LOG(Error, "aoti_torch_mps_run_command_block: unknown exception");
+        return Error::Internal;
+    }
+}
+
+// Single dispatch function that handles both cases
+AOTITorchError aoti_torch_mps_dispatch(
+    AOTIMetalKernelFunctionHandle func,
+    c10::ArrayRef<uint64_t> length,
+    c10::OptionalArrayRef<uint64_t> groupSize) {
+
+    if (!func) {
+        ET_LOG(Error, "aoti_torch_mps_dispatch: null function handle");
+        return Error::InvalidArgument;
+    }
+
+    try {
+        auto* function = reinterpret_cast<ETMetalKernelFunction*>(func);
+        function->dispatch(length, groupSize);
+
+        ET_LOG(Debug, "aoti_torch_mps_dispatch: Dispatched function %p with %zu dimensions", function, length.size());
+        return Error::Ok;
+
+    } catch (const std::exception& e) {
+        ET_LOG(Error, "aoti_torch_mps_dispatch exception: %s", e.what());
+        return Error::Internal;
+    } catch (...) {
+        ET_LOG(Error, "aoti_torch_mps_dispatch: unknown exception");
+        return Error::Internal;
+    }
+}
 
 } // namespace aoti
 } // namespace backends
