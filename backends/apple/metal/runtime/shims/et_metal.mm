@@ -444,7 +444,6 @@ void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, s
 
 }
 
-
 void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
     @autoreleasepool {
         if (!encoder_) {

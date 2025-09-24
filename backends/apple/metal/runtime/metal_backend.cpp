@@ -366,7 +366,14 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
       return Error::Internal;
     }
 
-    ET_LOG(Debug, "MetalBackend running done");
+    // Ensure all GPU work is completed before reading results
+    Error sync_err = aoti_torch_mps_synchronize_stream();
+    if (sync_err != Error::Ok) {
+      ET_LOG(Error, "Failed to synchronize Metal stream after kernel execution");
+      return Error::Internal;
+    }
+
+    ET_LOG(Debug, "MetalBackend running done and synchronized");
 
     // Copy GPU output results back to CPU output tensors
     for (int i = 0; i < n_outputs; i++) {
