@@ -234,10 +234,8 @@ ETMetalKernelFunction::ETMetalKernelFunction(id<MTLComputePipelineState> cps, id
 
 ETMetalKernelFunction::~ETMetalKernelFunction() {
     @autoreleasepool {
-        if (encoder_) {
-            [encoder_ release];
-            encoder_ = nil;
-        }
+        // Don't release encoder_ here - the stream owns it
+        // Only clean up our own references
         if (cps_) {
             [cps_ release];
             cps_ = nil;
@@ -246,27 +244,25 @@ ETMetalKernelFunction::~ETMetalKernelFunction() {
             [func_ release];
             func_ = nil;
         }
+
+        encoder_ = nil; // Clear reference without releasing
     }
 }
 
 void ETMetalKernelFunction::startEncoding() {
     @autoreleasepool {
-        if (encoder_) {
-            [encoder_ release];
-            encoder_ = nil;
-        }
-
+        // Don't retain/release the encoder - just get reference from stream
         ETMetalStream* stream = getCurrentMetalStream();
-        encoder_ = stream->getComputeCommandEncoder();
+        encoder_ = stream->commandEncoder(); // Use stream's managed encoder
         if (!encoder_) {
             ET_LOG(Error, "ETMetalKernelFunction: Failed to get encoder from stream");
             return;
         }
 
-        [encoder_ retain];
+        // Don't retain - stream owns the encoder
         [encoder_ setComputePipelineState:cps_];
 
-        ET_LOG(Debug, "ETMetalKernelFunction: Started encoding");
+        ET_LOG(Debug, "ETMetalKernelFunction: Started encoding with stream-managed encoder");
     }
 }
 
@@ -338,7 +334,6 @@ void ETMetalKernelFunction::dispatchSingle(uint64_t length) {
     [encoder_ dispatchThreads:size threadsPerThreadgroup:threadGroupSize];
     ET_LOG(Debug, "ETMetalKernelFunction::dispatchSingle: Dispatched with length %llu, group size %llu", length, actualGroupSize);
 
-    endEncoding();
 }
 
 void ETMetalKernelFunction::dispatchSingleWithGroupSize(uint64_t length, uint64_t group_size) {
@@ -356,7 +351,6 @@ void ETMetalKernelFunction::dispatchSingleWithGroupSize(uint64_t length, uint64_
     [encoder_ dispatchThreads:size threadsPerThreadgroup:threadGroupSize];
     ET_LOG(Debug, "ETMetalKernelFunction::dispatchSingleWithGroupSize: Dispatched with length %llu, group size %llu", length, actualGroupSize);
 
-    endEncoding();
 }
 
 void ETMetalKernelFunction::dispatchArray(const uint64_t* length, size_t length_size) {
@@ -396,7 +390,6 @@ void ETMetalKernelFunction::dispatchArray(const uint64_t* length, size_t length_
            length_size, size.width, size.height, size.depth,
            threadGroupSize.width, threadGroupSize.height, threadGroupSize.depth);
 
-    endEncoding();
 }
 
 void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, size_t length_size,
@@ -449,25 +442,8 @@ void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, s
            length_size, size.width, size.height, size.depth,
            threadGroupSize.width, threadGroupSize.height, threadGroupSize.depth);
 
-    endEncoding();
 }
 
-void ETMetalKernelFunction::endEncoding() {
-    @autoreleasepool {
-        if (!encoder_) {
-            ET_LOG(Error, "ETMetalKernelFunction::endEncoding: No active encoder");
-            return;
-        }
-
-        ETMetalStream* stream = getCurrentMetalStream();
-        stream->endEncoding(encoder_);
-
-        [encoder_ release];
-        encoder_ = nil;
-
-        ET_LOG(Debug, "ETMetalKernelFunction::endEncoding: Ended encoding");
-    }
-}
 
 void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
     @autoreleasepool {
@@ -477,7 +453,6 @@ void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
         }
 
         f();
-        endEncoding();
 
         ET_LOG(Debug, "ETMetalKernelFunction::runCommandBlock: Executed command block");
     }
@@ -766,7 +741,7 @@ void ETMetalStream::copy(id<MTLBuffer> srcBuffer, id<MTLBuffer> dstBuffer, size_
     });
 }
 
-// Legacy compatibility methods
+// Compatibility methods
 id<MTLCommandBuffer> ETMetalStream::getCommandBuffer() {
     return commandBuffer();
 }
@@ -774,7 +749,7 @@ id<MTLCommandBuffer> ETMetalStream::getCommandBuffer() {
 void ETMetalStream::commitCommandBuffer(id<MTLCommandBuffer> commandBuffer) {
     if (commandBuffer) {
         [commandBuffer commit];
-        ET_LOG(Debug, "ETMetalStream::commitCommandBuffer: Committed legacy command buffer %p", commandBuffer);
+        ET_LOG(Debug, "ETMetalStream::commitCommandBuffer: Committed command buffer %p", commandBuffer);
     }
 }
 
@@ -783,10 +758,8 @@ id<MTLComputeCommandEncoder> ETMetalStream::getComputeCommandEncoder() {
 }
 
 void ETMetalStream::endEncoding(id<MTLComputeCommandEncoder> encoder) {
-    if (encoder) {
-        [encoder endEncoding];
-        ET_LOG(Debug, "ETMetalStream::endEncoding: Ended encoding for legacy encoder %p", encoder);
-    }
+    // Don't end encoding here - the stream manages this through coalescing
+    ET_LOG(Debug, "ETMetalStream::endEncoding: Legacy method called for encoder %p - encoding managed by stream", encoder);
 }
 
 void ETMetalStream::synchronize() {
