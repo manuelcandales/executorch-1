@@ -22,9 +22,6 @@ namespace aoti {
 // Global Variables and Storage
 // =======================
 
-// Legacy Metal globals (will be deprecated in favor of stream-based approach)
-static id<MTLDevice> metalDevice = nil;
-static id<MTLCommandQueue> metalCommandQueue = nil;
 
 // Global Metal buffer mapping - accessible for MPS shim
 std::unordered_map<void*, id<MTLBuffer>> ptr_to_mtl_buffer;
@@ -46,33 +43,23 @@ static thread_local ETMetalStream* currentStream_ = nullptr;
 extern "C" {
 
 void metal_init_if_needed() {
-    if (!metalDevice) {
-        @autoreleasepool {
-            metalDevice = MTLCreateSystemDefaultDevice();
-            if (!metalDevice) {
-                ET_LOG(Error, "Failed to create Metal device");
-                return;
-            }
-
-            metalCommandQueue = [metalDevice newCommandQueue];
-            if (!metalCommandQueue) {
-                ET_LOG(Error, "Failed to create Metal command queue");
-                return;
-            }
-            ET_LOG(Info, "Metal initialized successfully");
-        }
+    // Initialization is now handled by ETMetalStream
+    ETMetalStream* stream = getCurrentMetalStream();
+    if (stream && stream->device()) {
+        ET_LOG(Info, "Metal initialized successfully via stream");
     }
 }
 
 void* metal_allocate_buffer(long bytes) {
-    metal_init_if_needed();
-    if (!metalDevice) {
-        ET_LOG(Error, "Failed to initialize Metal device");
+    ETMetalStream* stream = getCurrentMetalStream();
+    id<MTLDevice> device = stream->device();
+    if (!device) {
+        ET_LOG(Error, "Failed to get Metal device from stream");
         return nullptr;
     }
 
     @autoreleasepool {
-        id<MTLBuffer> buffer = [metalDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
         if (!buffer) {
             ET_LOG(Error, "Failed to allocate %ld bytes on Metal device", bytes);
             return nullptr;
@@ -95,9 +82,6 @@ void metal_cleanup_resources() {
             ptr_to_mtl_buffer.clear();
         }
     }
-
-    metalCommandQueue = nil;
-    metalDevice = nil;
 }
 
 bool metal_is_device_pointer(void* ptr) {
@@ -115,13 +99,9 @@ int metal_copy_memory(void* dst, const void* src, size_t nbytes, bool src_is_dev
 
         // For shared memory buffers, synchronization is typically not needed
         // since both CPU and GPU access the same memory space
-        if ((src_is_device || dst_is_device) && metalCommandQueue) {
-            // Only synchronize if we actually need to ensure GPU operations complete
-            id<MTLCommandBuffer> commandBuffer = [metalCommandQueue commandBuffer];
-            if (commandBuffer) {
-                [commandBuffer commit];
-                [commandBuffer waitUntilCompleted];
-            }
+        if (src_is_device || dst_is_device) {
+            ETMetalStream* stream = getCurrentMetalStream();
+            stream->synchronize(SyncType::COMMIT_AND_WAIT);
         }
     }
 
@@ -130,13 +110,13 @@ int metal_copy_memory(void* dst, const void* src, size_t nbytes, bool src_is_dev
 }
 
 id<MTLDevice> get_metal_device() {
-    // Use PyTorch-style stream-based device access
+    // Use stream-based device access
     ETMetalStream* stream = getCurrentMetalStream();
     return stream->device();
 }
 
 id<MTLCommandQueue> get_metal_command_queue() {
-    // Use PyTorch-style stream-based queue access
+    // Use stream-based queue access
     ETMetalStream* stream = getCurrentMetalStream();
     return stream->commandQueue();
 }
@@ -511,7 +491,7 @@ ETMetalStream::ETMetalStream()
     : device_(nil), commandQueue_(nil), commandBuffer_(nil), prevCommandBuffer_(nil),
       commandEncoder_(nil), serialQueue_(nullptr), enableCommitAndContinue_(true) {
     @autoreleasepool {
-        // Create our own device and command queue like PyTorch
+        // Create device and command queue
         device_ = MTLCreateSystemDefaultDevice();
         if (!device_) {
             ET_LOG(Error, "ETMetalStream: Failed to create Metal device");
@@ -526,10 +506,10 @@ ETMetalStream::ETMetalStream()
         }
         [commandQueue_ retain];
 
-        // Create serial queue for thread safety like PyTorch
+        // Create serial queue for thread safety
         serialQueue_ = dispatch_queue_create("metal gpu stream", nullptr);
 
-        ET_LOG(Debug, "ETMetalStream: Created PyTorch-style stream with device %p, queue %p", device_, commandQueue_);
+        ET_LOG(Debug, "ETMetalStream: Created stream with device %p, queue %p", device_, commandQueue_);
     }
 }
 
@@ -578,7 +558,7 @@ ETMetalStream::~ETMetalStream() {
         }
         activeCommandBuffers_.clear();
 
-        ET_LOG(Debug, "ETMetalStream: Destroyed PyTorch-style stream");
+        ET_LOG(Debug, "ETMetalStream: Destroyed stream");
     }
 }
 
@@ -589,7 +569,7 @@ ETMetalStream* ETMetalStream::getDefaultStream() {
     return defaultStream_;
 }
 
-// PyTorch-style lazy command buffer creation
+// Lazy command buffer creation
 id<MTLCommandBuffer> ETMetalStream::commandBuffer() {
     if (!commandBuffer_) {
         if (!commandQueue_) {
@@ -610,7 +590,7 @@ id<MTLCommandBuffer> ETMetalStream::commandBuffer() {
     return commandBuffer_;
 }
 
-// PyTorch-style lazy command encoder creation
+// Lazy command encoder creation
 id<MTLComputeCommandEncoder> ETMetalStream::commandEncoder() {
     if (!commandEncoder_) {
         id<MTLCommandBuffer> cmdBuffer = commandBuffer();
@@ -632,7 +612,7 @@ id<MTLComputeCommandEncoder> ETMetalStream::commandEncoder() {
     return commandEncoder_;
 }
 
-// PyTorch-style synchronization with SyncType
+// Synchronization with SyncType
 void ETMetalStream::synchronize(SyncType syncType) {
     dispatch_sync(serialQueue_, ^{
         @autoreleasepool {
@@ -667,7 +647,7 @@ void ETMetalStream::synchronize(SyncType syncType) {
     });
 }
 
-// PyTorch-style encoder coalescing management
+// Encoder coalescing management
 void ETMetalStream::endKernelCoalescing() {
     if (commandEncoder_) {
         [commandEncoder_ endEncoding];
@@ -677,10 +657,10 @@ void ETMetalStream::endKernelCoalescing() {
     }
 }
 
-// PyTorch-style commit methods
+// Commit methods
 void ETMetalStream::commit() {
     if (enableCommitAndContinue_ && commandBuffer_) {
-        // PyTorch's commit-and-continue for better performance
+        // Use commit-and-continue for better performance
         commitAndContinue();
     } else {
         flush();
@@ -712,12 +692,11 @@ void ETMetalStream::commitAndContinue() {
         return;
     }
 
-    // This is the key PyTorch optimization - commitAndContinue allows reusing the same buffer
+    // Commit buffer and allow immediate reuse for better performance
     [commandBuffer_ commit];
     ET_LOG(Debug, "ETMetalStream::commitAndContinue: Committed buffer %p with continue", commandBuffer_);
 
-    // Note: In PyTorch, commitAndContinue allows the buffer to be reused immediately
-    // The buffer itself handles the synchronization internally
+    // The buffer handles synchronization internally for commit-and-continue
 }
 
 void ETMetalStream::flush() {
@@ -736,7 +715,7 @@ void ETMetalStream::flush() {
     }
 }
 
-// PyTorch-style memory operations
+// Memory operations
 void ETMetalStream::fill(id<MTLBuffer> buffer, uint8_t value, size_t length, size_t offset, SyncType syncType) {
     if (length == 0) {
         return;
@@ -763,7 +742,7 @@ void ETMetalStream::copy(id<MTLBuffer> srcBuffer, id<MTLBuffer> dstBuffer, size_
             endKernelCoalescing();
             id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer() blitCommandEncoder];
 
-            // Handle large copies in chunks like PyTorch does
+            // Handle large copies in chunks
             constexpr size_t max_copy_size = 0x80000000; // 2GB
             size_t bytes_copied = 0;
             size_t bytes_remaining = length;

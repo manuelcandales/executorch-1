@@ -455,11 +455,11 @@ AOTITorchError aoti_torch_mps_copy_buffer(
 AOTITorchError aoti_torch_mps_synchronize_stream() {
     @autoreleasepool {
         try {
-            // Use the PyTorch-style ETMetalStream for proper synchronization
+            // Use the ETMetalStream for proper synchronization
             ETMetalStream* stream = getCurrentMetalStream();
             stream->synchronize(SyncType::COMMIT_AND_WAIT);
 
-            ET_LOG(Debug, "aoti_torch_mps_synchronize_stream: Stream synchronized with PyTorch-style COMMIT_AND_WAIT");
+            ET_LOG(Debug, "aoti_torch_mps_synchronize_stream: Stream synchronized with COMMIT_AND_WAIT");
             return Error::Ok;
 
         } catch (const std::exception& e) {
@@ -472,7 +472,7 @@ AOTITorchError aoti_torch_mps_synchronize_stream() {
     }
 }
 
-// Add PyTorch-style synchronization function with SyncType options
+// Synchronization function with SyncType options
 AOTITorchError aoti_torch_mps_synchronize_stream_with_type(int sync_type) {
     @autoreleasepool {
         try {

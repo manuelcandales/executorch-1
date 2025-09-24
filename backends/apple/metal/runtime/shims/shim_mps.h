@@ -97,7 +97,7 @@ AOTITorchError aoti_torch_mps_copy_buffer(
     size_t data_size,
     size_t src_offset,
     size_t dst_offset);
-// Stream management with PyTorch-style synchronization
+// Stream management with flexible synchronization
 AOTITorchError aoti_torch_mps_synchronize_stream();
 AOTITorchError aoti_torch_mps_synchronize_stream_with_type(int sync_type);
 

@@ -34,7 +34,7 @@ class ETMetalKernelFunction;
 class ETMetalStream;
 
 // =======================
-// SyncType - PyTorch-style synchronization options
+// SyncType - Metal synchronization options
 // =======================
 enum class SyncType {
     NONE,                // no commit to command buffer
@@ -46,7 +46,7 @@ enum class SyncType {
 
 // =======================
 // ETMetalShaderLibrary - ExecuTorch Metal shader library management
-// ================
+// =======================
 class ETMetalShaderLibrary {
 public:
     ETMetalShaderLibrary(const std::string& source);
@@ -92,7 +92,8 @@ private:
     id<MTLComputeCommandEncoder> encoder_;
 };
 
-// ETMetalStream - PyTorch-style Metal command buffer and synchronization management
+// =======================
+// ETMetalStream - Metal command buffer and synchronization management
 // =======================
 class ETMetalStream {
 public:
@@ -102,16 +103,16 @@ public:
     // Get the default stream (singleton)
     static ETMetalStream* getDefaultStream();
 
-    // PyTorch-style device and queue access
+    // Device and queue access
     id<MTLDevice> device() const { return device_; }
     id<MTLCommandQueue> commandQueue() const { return commandQueue_; }
     dispatch_queue_t queue() const { return serialQueue_; }
 
-    // PyTorch-style command buffer management with lazy creation
+    // Command buffer management with lazy creation
     id<MTLCommandBuffer> commandBuffer();
     id<MTLComputeCommandEncoder> commandEncoder();
 
-    // PyTorch-style synchronization methods
+    // Synchronization methods
     void synchronize(SyncType syncType = SyncType::COMMIT_AND_WAIT);
     void endKernelCoalescing();
 
@@ -120,23 +121,23 @@ public:
     void flush();
     bool isEmpty() const;
 
-    // PyTorch-style encoder management
+    // Encoder management
     id<MTLComputeCommandEncoder> getComputeCommandEncoder();
     void endEncoding(id<MTLComputeCommandEncoder> encoder);
 
-    // Memory operations like PyTorch
+    // Memory operations
     void fill(id<MTLBuffer> buffer, uint8_t value, size_t length, size_t offset, SyncType syncType = SyncType::NONE);
     void copy(id<MTLBuffer> srcBuffer, id<MTLBuffer> dstBuffer, size_t length,
              size_t srcOffset, size_t dstOffset, SyncType syncType = SyncType::NONE);
 
 private:
-    // PyTorch-style private members
+    // Private members
     id<MTLDevice> device_;
     id<MTLCommandQueue> commandQueue_;
     id<MTLCommandBuffer> commandBuffer_;
     id<MTLCommandBuffer> prevCommandBuffer_;  // For commit-and-continue pattern
     id<MTLComputeCommandEncoder> commandEncoder_;
-    dispatch_queue_t serialQueue_;  // For thread safety like PyTorch
+    dispatch_queue_t serialQueue_;  // For thread safety
 
     // Configuration
     bool enableCommitAndContinue_;
@@ -144,7 +145,7 @@ private:
     // Legacy compatibility
     std::vector<id<MTLCommandBuffer>> activeCommandBuffers_;
 
-    // PyTorch-style private synchronization methods
+    // Private synchronization methods
     void commit();
     void commitAndWait();
     void commitAndContinue();
@@ -155,7 +156,7 @@ private:
 
 // =======================
 // Global storage management functions
-// =========
+// =======================
 void storeFunctionHandle(ETMetalKernelFunction* raw_function, std::shared_ptr<ETMetalKernelFunction> function_shared_ptr);
 void storeLibraryHandle(ETMetalShaderLibrary* raw_library, std::unique_ptr<ETMetalShaderLibrary> library);
 bool removeFunctionHandle(ETMetalKernelFunction* raw_function);
