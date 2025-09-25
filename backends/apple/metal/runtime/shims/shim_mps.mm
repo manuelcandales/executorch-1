@@ -638,6 +638,9 @@ AOTITorchError aoti_torch_mps_mm_out(
         }
       }
 
+      // End any existing kernel coalescing to ensure a clean state for MPS
+      stream->endKernelCoalescing();
+
       // Get command buffer from stream (stream manages lifecycle)
       id<MTLCommandBuffer> commandBuffer = stream->commandBuffer();
 

@@ -21,10 +21,6 @@ using AOTIMetalKernelFunctionHandle = AOTIMetalKernelFunctionOpaque*;
 struct AOTIMetalShaderLibraryOpaque;
 using AOTIMetalShaderLibraryHandle = AOTIMetalShaderLibraryOpaque*;
 
-// // Match PyTorch's AtenTensorHandle definition
-// struct AtenTensorOpaque;
-// using AtenTensorHandle = AtenTensorOpaque*;
-
 #ifdef __cplusplus
 extern "C" {
 #endif

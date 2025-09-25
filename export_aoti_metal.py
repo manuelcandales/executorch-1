@@ -98,6 +98,17 @@ class Add(torch.nn.Module):
         return x + y
 
 
+class ElementwiseMmReduction(torch.nn.Module):
+    def __init__(self):
+        super(ElementwiseMmReduction, self).__init__()
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
+        x1 = x.sin() + x
+        y2 = y.cos() + 3
+        z = x1.mm(y2)
+        return z + z.sum()
+
+
 class DepthwiseConv(nn.Module):
     def __init__(self):
         super().__init__()
@@ -303,7 +314,12 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "mm": {
         "model_class": Mm,
         "input_shapes": [(11, 45), (45, 8)],
-        "description": "Simple linear layer model",
+        "description": "Simple mm layer model",
+    },
+    "elementwise_mm_reduction": {
+        "model_class": ElementwiseMmReduction,
+        "input_shapes": [(11, 45), (45, 8)],
+        "description": "Combining mm with elementwise and reduction ops",
     },
     "batchnorm": {
         "model_class": BatchNorm,
