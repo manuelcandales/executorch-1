@@ -22,7 +22,8 @@ if(NOT EXECUTORCH_ROOT)
 endif()
 
 include(${EXECUTORCH_ROOT}/tools/cmake/Utils.cmake)
-find_package_torch()
+# Use header-only torch dependency for libtorch-less AOTI
+find_package_torch_headers()
 
 set(_aoti_metal_sources
     runtime/metal_backend.cpp
@@ -55,14 +56,12 @@ target_compile_options(metal_backend PUBLIC -fexceptions -frtti -fPIC)
 
 target_link_options(metal_backend PUBLIC -Wl,-export_dynamic)
 
-# Link against appropriate backends and standard libraries
+# Link against appropriate backends and standard libraries (no libtorch for libtorch-less AOTI)
 target_link_libraries(
   metal_backend
   PUBLIC
     extension_tensor
     ${CMAKE_DL_LIBS}
-    # Link PyTorch libraries for AOTI functions
-    ${TORCH_LIBRARIES}
 )
 
 executorch_target_link_options_shared_lib(metal_backend)

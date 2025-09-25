@@ -102,8 +102,11 @@ class MetalBackend(BackendDetails):
             "aot_inductor.force_mmap_weights": False,
             "max_autotune": True,
             # "aot_inductor.embed_kernel_binary": True,
-            # "aot_inductor.link_libtorch": False,
+            "aot_inductor.link_libtorch": False,
             # "aot_inductor.debug_compile": True,
+            # # Disable CPU threading/OpenMP to avoid libomp.dylib dependency
+            # "cpp.enable_kernel_profile": False,
+            # "cpp.threads": 1,  # Use single-threaded mode
         }
 
         with collect_unsupported_fallback_kernels():
