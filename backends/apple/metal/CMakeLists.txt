@@ -29,6 +29,7 @@ set(_aoti_metal_sources
     runtime/aoti_model_container.cpp
     runtime/shims/memory.cpp
     runtime/shims/et_metal.mm
+    runtime/shims/et_metal_ops.mm
     runtime/shims/shim_mps.mm
     runtime/shims/tensor_attribute.cpp
     runtime/shims/utils.cpp
