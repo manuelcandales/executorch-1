@@ -22,8 +22,8 @@ if(NOT EXECUTORCH_ROOT)
 endif()
 
 include(${EXECUTORCH_ROOT}/tools/cmake/Utils.cmake)
-# Use header-only torch dependency for libtorch-less AOTI
-find_package_torch_headers()
+# Use full torch package to get library paths, but only link specific libraries
+find_package_torch()
 
 set(_aoti_metal_sources
     runtime/metal_backend.cpp
@@ -56,13 +56,47 @@ target_compile_options(metal_backend PUBLIC -fexceptions -frtti -fPIC)
 
 target_link_options(metal_backend PUBLIC -Wl,-export_dynamic)
 
-# Link against appropriate backends and standard libraries (no libtorch for libtorch-less AOTI)
+# Find PyTorch's OpenMP library specifically for libtorch-less AOTI
+get_torch_base_path(TORCH_BASE_PATH)
+find_library(TORCH_OMP_LIBRARY
+    NAMES omp libomp
+    PATHS "${TORCH_BASE_PATH}/lib"
+    NO_DEFAULT_PATH
+)
+
+if(TORCH_OMP_LIBRARY)
+    message(STATUS "Found PyTorch OpenMP library: ${TORCH_OMP_LIBRARY}")
+    # Get the directory containing the OpenMP library for rpath
+    get_filename_component(TORCH_OMP_LIB_DIR ${TORCH_OMP_LIBRARY} DIRECTORY)
+    message(STATUS "OpenMP library directory: ${TORCH_OMP_LIB_DIR}")
+else()
+    message(WARNING "PyTorch OpenMP library not found, may cause runtime linking issues")
+endif()
+
+# Link against appropriate backends and standard libraries
 target_link_libraries(
   metal_backend
   PUBLIC
     extension_tensor
     ${CMAKE_DL_LIBS}
+    ${TORCH_OMP_LIBRARY}
 )
+
+# Set rpath for OpenMP library to avoid runtime linking issues
+if(TORCH_OMP_LIBRARY AND TORCH_OMP_LIB_DIR)
+    # Add the OpenMP library directory to the rpath
+    set_target_properties(metal_backend PROPERTIES
+        BUILD_RPATH "${TORCH_OMP_LIB_DIR}"
+        INSTALL_RPATH "${TORCH_OMP_LIB_DIR}"
+    )
+    # Also try common OpenMP library locations
+    target_link_options(metal_backend PUBLIC
+        -Wl,-rpath,${TORCH_OMP_LIB_DIR}
+        -Wl,-rpath,/usr/local/opt/libomp/lib
+        -Wl,-rpath,/opt/homebrew/opt/libomp/lib
+    )
+    message(STATUS "Added rpath for OpenMP library: ${TORCH_OMP_LIB_DIR}")
+endif()
 
 executorch_target_link_options_shared_lib(metal_backend)
 install(
