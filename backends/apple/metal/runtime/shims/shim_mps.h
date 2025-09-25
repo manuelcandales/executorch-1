@@ -21,9 +21,9 @@ using AOTIMetalKernelFunctionHandle = AOTIMetalKernelFunctionOpaque*;
 struct AOTIMetalShaderLibraryOpaque;
 using AOTIMetalShaderLibraryHandle = AOTIMetalShaderLibraryOpaque*;
 
-// Match PyTorch's AtenTensorHandle definition
-struct AtenTensorOpaque;
-using AtenTensorHandle = AtenTensorOpaque*;
+// // Match PyTorch's AtenTensorHandle definition
+// struct AtenTensorOpaque;
+// using AtenTensorHandle = AtenTensorOpaque*;
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,10 +34,10 @@ extern "C" {
  * Performs matrix multiplication with bias: out = beta * self + alpha * (mat1 @ mat2)
  */
 AOTITorchError aoti_torch_mps_addmm_out(
-    AtenTensorHandle out,
-    AtenTensorHandle self,
-    AtenTensorHandle mat1,
-    AtenTensorHandle mat2,
+    AOTITensorHandle out,
+    AOTITensorHandle self,
+    AOTITensorHandle mat1,
+    AOTITensorHandle mat2,
     double beta,
     double alpha);
 
@@ -46,18 +46,18 @@ AOTITorchError aoti_torch_mps_addmm_out(
  * Performs simple matrix multiplication: out = self @ mat2
  */
 AOTITorchError aoti_torch_mps_mm_out(
-    AtenTensorHandle out,
-    AtenTensorHandle self,
-    AtenTensorHandle mat2);
+    AOTITensorHandle out,
+    AOTITensorHandle self,
+    AOTITensorHandle mat2);
 
 /**
  * ExecutorTorch implementation of aoti_torch_mps_convolution.
  * Performs 2D convolution operation - matches PyTorch AOTI signature
  */
 AOTITorchError aoti_torch_mps_convolution(
-    AtenTensorHandle input,
-    AtenTensorHandle weight,
-    AtenTensorHandle* bias,
+    AOTITensorHandle input,
+    AOTITensorHandle weight,
+    AOTITensorHandle* bias,
     const int64_t* stride,
     int64_t stride_len_,
     const int64_t* padding,
@@ -68,7 +68,7 @@ AOTITorchError aoti_torch_mps_convolution(
     const int64_t* output_padding,
     int64_t output_padding_len_,
     int64_t groups,
-    AtenTensorHandle* ret0);
+    AOTITensorHandle* ret0);
 
 // MetalShaderLibrary functions
 AOTITorchError aoti_torch_mps_create_shader_library(
@@ -90,7 +90,7 @@ AOTITorchError aoti_torch_mps_start_encoding(
 AOTITorchError aoti_torch_mps_set_arg_tensor(
     AOTIMetalKernelFunctionHandle func,
     unsigned idx,
-    AtenTensorHandle tensor);
+    AOTITensorHandle tensor);
 
 AOTITorchError aoti_torch_mps_set_arg_int(
     AOTIMetalKernelFunctionHandle func,

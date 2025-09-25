@@ -150,7 +150,7 @@ AOTITorchError aoti_torch_mps_start_encoding(
 AOTITorchError aoti_torch_mps_set_arg_tensor(
     AOTIMetalKernelFunctionHandle func,
     unsigned idx,
-    AtenTensorHandle tensor) {
+    AOTITensorHandle tensor) {
 
     if (!func || !tensor) {
         ET_LOG(Error, "aoti_torch_mps_set_arg_tensor: null function handle or tensor");
@@ -524,10 +524,10 @@ AOTITorchError aoti_torch_mps_run_command_block(
 }
 
 AOTITorchError aoti_torch_mps_addmm_out(
-    AtenTensorHandle out,
-    AtenTensorHandle self,
-    AtenTensorHandle mat1,
-    AtenTensorHandle mat2,
+    AOTITensorHandle out,
+    AOTITensorHandle self,
+    AOTITensorHandle mat1,
+    AOTITensorHandle mat2,
     double beta,
     double alpha) {
   ET_LOG(Debug, "aoti_torch_mps_addmm_out: Starting with out=%p, self=%p, mat1=%p, mat2=%p, beta=%f, alpha=%f",
@@ -540,7 +540,7 @@ AOTITorchError aoti_torch_mps_addmm_out(
 
   @autoreleasepool {
     try {
-      // Convert AtenTensorHandle to ExecutorTorch tensors
+      // Convert AOTITensorHandle to ExecutorTorch tensors
       auto out_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(out);
       auto self_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(self);
       auto mat1_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(mat1);
@@ -577,9 +577,9 @@ AOTITorchError aoti_torch_mps_addmm_out(
 }
 
 AOTITorchError aoti_torch_mps_mm_out(
-    AtenTensorHandle out,
-    AtenTensorHandle self,
-    AtenTensorHandle mat2) {
+    AOTITensorHandle out,
+    AOTITensorHandle self,
+    AOTITensorHandle mat2) {
   ET_LOG(Debug, "aoti_torch_mps_mm_out: Starting with out=%p, self=%p, mat2=%p",
          out, self, mat2);
 
@@ -590,7 +590,7 @@ AOTITorchError aoti_torch_mps_mm_out(
 
   @autoreleasepool {
     try {
-      // Convert AtenTensorHandle to ExecutorTorch tensors
+      // Convert AOTITensorHandle to ExecutorTorch tensors
       auto out_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(out);
       auto self_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(self);
       auto mat2_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(mat2);
@@ -635,9 +635,9 @@ AOTITorchError aoti_torch_mps_mm_out(
 }
 
 AOTITorchError aoti_torch_mps_convolution(
-    AtenTensorHandle input,
-    AtenTensorHandle weight,
-    AtenTensorHandle* bias,
+    AOTITensorHandle input,
+    AOTITensorHandle weight,
+    AOTITensorHandle* bias,
     const int64_t* stride,
     int64_t stride_len_,
     const int64_t* padding,
@@ -648,7 +648,7 @@ AOTITorchError aoti_torch_mps_convolution(
     const int64_t* output_padding,
     int64_t output_padding_len_,
     int64_t groups,
-    AtenTensorHandle* ret0) {
+    AOTITensorHandle* ret0) {
   ET_LOG(Debug, "aoti_torch_mps_convolution: Starting with input=%p, weight=%p, bias=%p, groups=%lld, transposed=%d",
          input, weight, bias, groups, transposed);
 
@@ -659,7 +659,7 @@ AOTITorchError aoti_torch_mps_convolution(
 
   @autoreleasepool {
     try {
-      // Convert AtenTensorHandle to ExecutorTorch tensors
+      // Convert AOTITensorHandle to ExecutorTorch tensors
       auto input_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(input);
       auto weight_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(weight);
 
@@ -770,7 +770,7 @@ AOTITorchError aoti_torch_mps_convolution(
           1                       // Stride for W dimension
       };
 
-      AtenTensorHandle output_tensor_handle = nullptr;
+      AOTITensorHandle output_tensor_handle = nullptr;
 
       AOTITorchError create_result = aoti_torch_create_tensor_from_blob_v2(
           tensor_data,
