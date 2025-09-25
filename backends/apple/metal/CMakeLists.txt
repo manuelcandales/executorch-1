@@ -47,7 +47,8 @@ target_include_directories(
 # Link Metal framework
 find_library(METAL_LIBRARY Metal REQUIRED)
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
-target_link_libraries(metal_backend PUBLIC ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
+find_library(METALPERFORMANCESHADERS_LIBRARY MetalPerformanceShaders REQUIRED)
+target_link_libraries(metal_backend PUBLIC ${METAL_LIBRARY} ${FOUNDATION_LIBRARY} ${METALPERFORMANCESHADERS_LIBRARY})
 
 target_compile_options(metal_backend PUBLIC -fexceptions -frtti -fPIC)
 

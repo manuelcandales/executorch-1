@@ -16,10 +16,14 @@
 #include "utils.h"
 #include "memory.h"
 #include <functional>
+#include <unordered_map>
 
 namespace executorch {
 namespace backends {
 namespace aoti {
+
+// Declare the global mapping from et_metal.mm
+extern std::unordered_map<void*, id<MTLBuffer>> ptr_to_mtl_buffer;
 
 extern "C" {
 
@@ -548,22 +552,239 @@ AOTITorchError aoti_torch_mps_addmm_out(
 
       ET_LOG(Debug, "aoti_torch_mps_addmm_out: Converted tensor handles to ET tensors");
 
-      // For now, just zero out the output tensor to get the right shape
-      // TODO: Implement actual matrix multiplication: out = beta * self + alpha * (mat1 @ mat2)
-
-      // Get output data pointer and size
-      float* out_data = static_cast<float*>(out_tensor->mutable_data_ptr());
-      size_t out_numel = out_tensor->numel();
-
-      if (!out_data) {
-        ET_LOG(Error, "aoti_torch_mps_addmm_out: null output data pointer");
+      // Validate tensor dimensions
+      if (mat1_tensor->dim() != 2 || mat2_tensor->dim() != 2) {
+        ET_LOG(Error, "aoti_torch_mps_addmm_out: mat1 and mat2 must be 2-D, got %d and %d",
+               (int)mat1_tensor->dim(), (int)mat2_tensor->dim());
         return Error::InvalidArgument;
       }
 
-      // Zero out the output tensor
-      std::memset(out_data, 0, out_numel * sizeof(float));
+      // Get matrix dimensions for addmm: out = beta * self + alpha * (mat1 @ mat2)
+      int64_t M = mat1_tensor->sizes()[0];  // rows of mat1
+      int64_t K = mat1_tensor->sizes()[1];  // cols of mat1 / rows of mat2
+      int64_t N = mat2_tensor->sizes()[1];  // cols of mat2
 
-      ET_LOG(Debug, "aoti_torch_mps_addmm_out: Zeroed output tensor with %zu elements", out_numel);
+      // Check matrix multiplication compatibility
+      if (mat1_tensor->sizes()[1] != mat2_tensor->sizes()[0]) {
+        ET_LOG(Error, "aoti_torch_mps_addmm_out: incompatible matrix sizes for mm (%dx%d and %dx%d)",
+               (int)M, (int)K, (int)mat2_tensor->sizes()[0], (int)N);
+        return Error::InvalidArgument;
+      }
+
+      // Check bias tensor compatibility - self should be broadcastable to (M, N)
+      bool self_is_scalar = (self_tensor->dim() == 0 || (self_tensor->dim() == 1 && self_tensor->sizes()[0] == 1));
+      if (!self_is_scalar) {
+        if (self_tensor->dim() == 1) {
+          // 1D bias should have size N (broadcastable along rows)
+          if (self_tensor->sizes()[0] != N) {
+            ET_LOG(Error, "aoti_torch_mps_addmm_out: 1D bias size %d doesn't match output width %d",
+                   (int)self_tensor->sizes()[0], (int)N);
+            return Error::InvalidArgument;
+          }
+        } else if (self_tensor->dim() == 2) {
+          // 2D bias should match (M, N)
+          if (self_tensor->sizes()[0] != M || self_tensor->sizes()[1] != N) {
+            ET_LOG(Error, "aoti_torch_mps_addmm_out: 2D bias size [%dx%d] doesn't match output size [%dx%d]",
+                   (int)self_tensor->sizes()[0], (int)self_tensor->sizes()[1], (int)M, (int)N);
+            return Error::InvalidArgument;
+          }
+        } else {
+          ET_LOG(Error, "aoti_torch_mps_addmm_out: bias tensor must be 0D, 1D, or 2D, got %dD", (int)self_tensor->dim());
+          return Error::InvalidArgument;
+        }
+      }
+
+      // Log tensor shapes for debugging
+      ET_LOG(Debug, "aoti_torch_mps_addmm_out: mat1 shape: [%d, %d], mat2 shape: [%d, %d], self shape: [%s], out shape: [%d, %d]",
+             (int)M, (int)K, (int)mat2_tensor->sizes()[0], (int)N,
+             self_is_scalar ? "scalar" : (self_tensor->dim() == 1 ? "1D" : "2D"),
+             out_tensor->dim() > 0 ? (int)out_tensor->sizes()[0] : 0,
+             out_tensor->dim() > 1 ? (int)out_tensor->sizes()[1] : 0);
+
+      // Get Metal device and stream
+      ETMetalStream* stream = getCurrentMetalStream();
+      id<MTLDevice> device = get_metal_device();
+      if (!device) {
+        ET_LOG(Error, "aoti_torch_mps_addmm_out: Failed to get Metal device");
+        return Error::Internal;
+      }
+
+      // Get Metal buffers from tensors using the global mapping
+      void* self_data_ptr = self_tensor->mutable_data_ptr();
+      void* mat1_data_ptr = mat1_tensor->mutable_data_ptr();
+      void* mat2_data_ptr = mat2_tensor->mutable_data_ptr();
+      void* out_data_ptr = out_tensor->mutable_data_ptr();
+
+      id<MTLBuffer> self_buffer = nullptr;
+      id<MTLBuffer> mat1_buffer = nullptr;
+      id<MTLBuffer> mat2_buffer = nullptr;
+      id<MTLBuffer> out_buffer = nullptr;
+
+      // Look up Metal buffers from the global mapping
+      auto self_it = ptr_to_mtl_buffer.find(self_data_ptr);
+      auto mat1_it = ptr_to_mtl_buffer.find(mat1_data_ptr);
+      auto mat2_it = ptr_to_mtl_buffer.find(mat2_data_ptr);
+      auto out_it = ptr_to_mtl_buffer.find(out_data_ptr);
+
+      if (self_it != ptr_to_mtl_buffer.end()) {
+        self_buffer = self_it->second;
+      }
+      if (mat1_it != ptr_to_mtl_buffer.end()) {
+        mat1_buffer = mat1_it->second;
+      }
+      if (mat2_it != ptr_to_mtl_buffer.end()) {
+        mat2_buffer = mat2_it->second;
+      }
+      if (out_it != ptr_to_mtl_buffer.end()) {
+        out_buffer = out_it->second;
+      }
+
+      // If buffers are not in Metal memory, create temporary Metal buffers
+      if (!self_buffer) {
+        size_t self_size = self_tensor->numel() * sizeof(float);
+        self_buffer = [device newBufferWithBytes:self_data_ptr
+                                          length:self_size
+                                         options:MTLResourceStorageModeShared];
+        if (!self_buffer) {
+          ET_LOG(Error, "aoti_torch_mps_addmm_out: Failed to create Metal buffer for self tensor");
+          return Error::Internal;
+        }
+      }
+
+      if (!mat1_buffer) {
+        size_t mat1_size = mat1_tensor->numel() * sizeof(float);
+        mat1_buffer = [device newBufferWithBytes:mat1_data_ptr
+                                          length:mat1_size
+                                         options:MTLResourceStorageModeShared];
+        if (!mat1_buffer) {
+          ET_LOG(Error, "aoti_torch_mps_addmm_out: Failed to create Metal buffer for mat1 tensor");
+          return Error::Internal;
+        }
+      }
+
+      if (!mat2_buffer) {
+        size_t mat2_size = mat2_tensor->numel() * sizeof(float);
+        mat2_buffer = [device newBufferWithBytes:mat2_data_ptr
+                                          length:mat2_size
+                                         options:MTLResourceStorageModeShared];
+        if (!mat2_buffer) {
+          ET_LOG(Error, "aoti_torch_mps_addmm_out: Failed to create Metal buffer for mat2 tensor");
+          return Error::Internal;
+        }
+      }
+
+      if (!out_buffer) {
+        size_t out_size = out_tensor->numel() * sizeof(float);
+        out_buffer = [device newBufferWithBytes:out_data_ptr
+                                         length:out_size
+                                        options:MTLResourceStorageModeShared];
+        if (!out_buffer) {
+          ET_LOG(Error, "aoti_torch_mps_addmm_out: Failed to create Metal buffer for out tensor");
+          return Error::Internal;
+        }
+      }
+
+      // Get command buffer from stream (stream manages lifecycle)
+      id<MTLCommandBuffer> commandBuffer = stream->commandBuffer();
+
+      // Step 1: Handle the bias term: out = beta * self
+      bool is_beta_nonzero = (beta != 0.0);
+
+      if (is_beta_nonzero) {
+        // First copy and scale self to output: out = beta * self
+        if (self_is_scalar) {
+          // Handle scalar bias - fill the output with beta * scalar_value
+          float scalar_value = *static_cast<float*>(self_data_ptr);
+          float scaled_scalar = beta * scalar_value;
+
+          // Fill the output buffer with the scaled scalar
+          float* out_ptr = static_cast<float*>([out_buffer contents]);
+          for (size_t i = 0; i < out_tensor->numel(); ++i) {
+            out_ptr[i] = scaled_scalar;
+          }
+        } else {
+          // Handle vector/matrix bias
+          float* self_ptr = static_cast<float*>([self_buffer contents]);
+          float* out_ptr = static_cast<float*>([out_buffer contents]);
+
+          if (self_tensor->dim() == 1) {
+            // Broadcast 1D bias across rows
+            for (int64_t i = 0; i < M; ++i) {
+              for (int64_t j = 0; j < N; ++j) {
+                out_ptr[i * N + j] = beta * self_ptr[j];
+              }
+            }
+          } else {
+            // 2D bias - direct scaling
+            for (size_t i = 0; i < out_tensor->numel(); ++i) {
+              out_ptr[i] = beta * self_ptr[i];
+            }
+          }
+        }
+      } else {
+        // beta == 0, so we'll just zero the output initially and let the matmul handle it
+        float* out_ptr = static_cast<float*>([out_buffer contents]);
+        memset(out_ptr, 0, out_tensor->numel() * sizeof(float));
+      }
+
+      // Step 2: Perform alpha * (mat1 @ mat2) and add to the result
+      // Create matrix descriptors for the multiplication
+      MPSMatrixDescriptor* mat1Desc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
+                                                                            columns:K
+                                                                           matrices:1
+                                                                           rowBytes:K * sizeof(float)
+                                                                        matrixBytes:M * K * sizeof(float)
+                                                                           dataType:MPSDataTypeFloat32];
+
+      MPSMatrixDescriptor* mat2Desc = [MPSMatrixDescriptor matrixDescriptorWithRows:K
+                                                                            columns:N
+                                                                           matrices:1
+                                                                           rowBytes:N * sizeof(float)
+                                                                        matrixBytes:K * N * sizeof(float)
+                                                                           dataType:MPSDataTypeFloat32];
+
+      MPSMatrixDescriptor* outDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
+                                                                           columns:N
+                                                                          matrices:1
+                                                                          rowBytes:N * sizeof(float)
+                                                                       matrixBytes:M * N * sizeof(float)
+                                                                          dataType:MPSDataTypeFloat32];
+
+      MPSMatrix* mat1Matrix = [[MPSMatrix alloc] initWithBuffer:mat1_buffer
+                                                         offset:0
+                                                     descriptor:mat1Desc];
+
+      MPSMatrix* mat2Matrix = [[MPSMatrix alloc] initWithBuffer:mat2_buffer
+                                                         offset:0
+                                                     descriptor:mat2Desc];
+
+      MPSMatrix* outMatrix = [[MPSMatrix alloc] initWithBuffer:out_buffer
+                                                        offset:0
+                                                    descriptor:outDesc];
+
+      // Create matrix multiplication kernel with alpha and beta parameters
+      MPSMatrixMultiplication* matmul = [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                                                         transposeLeft:NO
+                                                                        transposeRight:NO
+                                                                            resultRows:M
+                                                                         resultColumns:N
+                                                                      interiorColumns:K
+                                                                                 alpha:alpha
+                                                                                  beta:1.0]; // beta=1.0 to add to existing result
+
+      // Encode the matrix multiplication (stream will handle commit/synchronization)
+      [matmul encodeToCommandBuffer:commandBuffer
+                         leftMatrix:mat1Matrix
+                        rightMatrix:mat2Matrix
+                       resultMatrix:outMatrix];
+
+      // Clean up MPS objects
+      [mat1Matrix release];
+      [mat2Matrix release];
+      [outMatrix release];
+      [matmul release];
+
+      ET_LOG(Debug, "aoti_torch_mps_addmm_out: Matrix addmm completed successfully");
       return Error::Ok;
 
     } catch (const std::exception& e) {
@@ -597,31 +818,156 @@ AOTITorchError aoti_torch_mps_mm_out(
 
       ET_LOG(Debug, "aoti_torch_mps_mm_out: Converted tensor handles to ET tensors");
 
-      // Log tensor shapes for debugging
-      ET_LOG(Debug, "aoti_torch_mps_mm_out: self shape: [%d, %d], mat2 shape: [%d, %d], out shape: [%d, %d]",
-             self_tensor->dim() > 0 ? (int)self_tensor->sizes()[0] : 0,
-             self_tensor->dim() > 1 ? (int)self_tensor->sizes()[1] : 0,
-             mat2_tensor->dim() > 0 ? (int)mat2_tensor->sizes()[0] : 0,
-             mat2_tensor->dim() > 1 ? (int)mat2_tensor->sizes()[1] : 0,
-             out_tensor->dim() > 0 ? (int)out_tensor->sizes()[0] : 0,
-             out_tensor->dim() > 1 ? (int)out_tensor->sizes()[1] : 0);
-
-      // For now, just zero out the output tensor to get the right shape
-      // TODO: Implement actual matrix multiplication: out = self @ mat2
-
-      // Get output data pointer and size
-      float* out_data = static_cast<float*>(out_tensor->mutable_data_ptr());
-      size_t out_numel = out_tensor->numel();
-
-      if (!out_data) {
-        ET_LOG(Error, "aoti_torch_mps_mm_out: null output data pointer");
+      // Validate tensor dimensions
+      if (self_tensor->dim() != 2 || mat2_tensor->dim() != 2) {
+        ET_LOG(Error, "aoti_torch_mps_mm_out: tensors must be 2-D, got %d and %d",
+               (int)self_tensor->dim(), (int)mat2_tensor->dim());
         return Error::InvalidArgument;
       }
 
-      // Zero out the output tensor
-      std::memset(out_data, 0, out_numel * sizeof(float));
+      int64_t M = self_tensor->sizes()[0];  // rows of self
+      int64_t K = self_tensor->sizes()[1];  // cols of self / rows of mat2
+      int64_t N = mat2_tensor->sizes()[1];  // cols of mat2
 
-      ET_LOG(Debug, "aoti_torch_mps_mm_out: Zeroed output tensor with %zu elements", out_numel);
+      // Check matrix multiplication compatibility
+      if (self_tensor->sizes()[1] != mat2_tensor->sizes()[0]) {
+        ET_LOG(Error, "aoti_torch_mps_mm_out: incompatible matrix sizes for mm (%dx%d and %dx%d)",
+               (int)M, (int)K, (int)mat2_tensor->sizes()[0], (int)N);
+        return Error::InvalidArgument;
+      }
+
+      // Log tensor shapes for debugging
+      ET_LOG(Debug, "aoti_torch_mps_mm_out: self shape: [%d, %d], mat2 shape: [%d, %d], out shape: [%d, %d]",
+             (int)M, (int)K, (int)mat2_tensor->sizes()[0], (int)N,
+             out_tensor->dim() > 0 ? (int)out_tensor->sizes()[0] : 0,
+             out_tensor->dim() > 1 ? (int)out_tensor->sizes()[1] : 0);
+
+      // Get Metal device and stream
+      ETMetalStream* stream = getCurrentMetalStream();
+      id<MTLDevice> device = get_metal_device();
+      if (!device) {
+        ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to get Metal device");
+        return Error::Internal;
+      }
+
+      // Get Metal buffers from tensors using the global mapping
+      void* self_data_ptr = self_tensor->mutable_data_ptr();
+      void* mat2_data_ptr = mat2_tensor->mutable_data_ptr();
+      void* out_data_ptr = out_tensor->mutable_data_ptr();
+
+      id<MTLBuffer> self_buffer = nullptr;
+      id<MTLBuffer> mat2_buffer = nullptr;
+      id<MTLBuffer> out_buffer = nullptr;
+
+      // Look up Metal buffers from the global mapping
+      auto self_it = ptr_to_mtl_buffer.find(self_data_ptr);
+      auto mat2_it = ptr_to_mtl_buffer.find(mat2_data_ptr);
+      auto out_it = ptr_to_mtl_buffer.find(out_data_ptr);
+
+      if (self_it != ptr_to_mtl_buffer.end()) {
+        self_buffer = self_it->second;
+      }
+      if (mat2_it != ptr_to_mtl_buffer.end()) {
+        mat2_buffer = mat2_it->second;
+      }
+      if (out_it != ptr_to_mtl_buffer.end()) {
+        out_buffer = out_it->second;
+      }
+
+      // If buffers are not in Metal memory, create temporary Metal buffers
+      if (!self_buffer) {
+        size_t self_size = self_tensor->numel() * sizeof(float);
+        self_buffer = [device newBufferWithBytes:self_data_ptr
+                                          length:self_size
+                                         options:MTLResourceStorageModeShared];
+        if (!self_buffer) {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for self tensor");
+          return Error::Internal;
+        }
+      }
+
+      if (!mat2_buffer) {
+        size_t mat2_size = mat2_tensor->numel() * sizeof(float);
+        mat2_buffer = [device newBufferWithBytes:mat2_data_ptr
+                                          length:mat2_size
+                                         options:MTLResourceStorageModeShared];
+        if (!mat2_buffer) {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for mat2 tensor");
+          return Error::Internal;
+        }
+      }
+
+      if (!out_buffer) {
+        size_t out_size = out_tensor->numel() * sizeof(float);
+        out_buffer = [device newBufferWithBytes:out_data_ptr
+                                         length:out_size
+                                        options:MTLResourceStorageModeShared];
+        if (!out_buffer) {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for out tensor");
+          return Error::Internal;
+        }
+      }
+
+      // Get command buffer from stream (stream manages lifecycle)
+      id<MTLCommandBuffer> commandBuffer = stream->commandBuffer();
+
+      // Create matrix descriptors for the multiplication
+      MPSMatrixDescriptor* selfDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
+                                                                            columns:K
+                                                                           matrices:1
+                                                                           rowBytes:K * sizeof(float)
+                                                                        matrixBytes:M * K * sizeof(float)
+                                                                           dataType:MPSDataTypeFloat32];
+
+      MPSMatrixDescriptor* mat2Desc = [MPSMatrixDescriptor matrixDescriptorWithRows:K
+                                                                            columns:N
+                                                                           matrices:1
+                                                                           rowBytes:N * sizeof(float)
+                                                                        matrixBytes:K * N * sizeof(float)
+                                                                           dataType:MPSDataTypeFloat32];
+
+      MPSMatrixDescriptor* outDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
+                                                                           columns:N
+                                                                          matrices:1
+                                                                          rowBytes:N * sizeof(float)
+                                                                       matrixBytes:M * N * sizeof(float)
+                                                                          dataType:MPSDataTypeFloat32];
+
+      MPSMatrix* selfMatrix = [[MPSMatrix alloc] initWithBuffer:self_buffer
+                                                         offset:0
+                                                     descriptor:selfDesc];
+
+      MPSMatrix* mat2Matrix = [[MPSMatrix alloc] initWithBuffer:mat2_buffer
+                                                         offset:0
+                                                     descriptor:mat2Desc];
+
+      MPSMatrix* outMatrix = [[MPSMatrix alloc] initWithBuffer:out_buffer
+                                                        offset:0
+                                                    descriptor:outDesc];
+
+      // Create matrix multiplication kernel
+      MPSMatrixMultiplication* matmul = [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                                                         transposeLeft:NO
+                                                                        transposeRight:NO
+                                                                            resultRows:M
+                                                                         resultColumns:N
+                                                                      interiorColumns:K
+                                                                                 alpha:1.0
+                                                                                  beta:0.0];
+
+      // Encode the matrix multiplication (stream will handle commit/synchronization)
+      [matmul encodeToCommandBuffer:commandBuffer
+                         leftMatrix:selfMatrix
+                        rightMatrix:mat2Matrix
+                       resultMatrix:outMatrix];
+
+      // Clean up MPS objects
+      [selfMatrix release];
+      [mat2Matrix release];
+      [outMatrix release];
+      [matmul release];
+
+      ET_LOG(Debug, "aoti_torch_mps_mm_out: Matrix multiplication completed successfully");
       return Error::Ok;
 
     } catch (const std::exception& e) {
