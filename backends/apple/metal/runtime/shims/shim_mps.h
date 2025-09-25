@@ -29,6 +29,47 @@ using AtenTensorHandle = AtenTensorOpaque*;
 extern "C" {
 #endif
 
+/**
+ * ExecutorTorch implementation of aoti_torch_mps_addmm_out.
+ * Performs matrix multiplication with bias: out = beta * self + alpha * (mat1 @ mat2)
+ */
+AOTITorchError aoti_torch_mps_addmm_out(
+    AtenTensorHandle out,
+    AtenTensorHandle self,
+    AtenTensorHandle mat1,
+    AtenTensorHandle mat2,
+    double beta,
+    double alpha);
+
+/**
+ * ExecutorTorch implementation of aoti_torch_mps_mm_out.
+ * Performs simple matrix multiplication: out = self @ mat2
+ */
+AOTITorchError aoti_torch_mps_mm_out(
+    AtenTensorHandle out,
+    AtenTensorHandle self,
+    AtenTensorHandle mat2);
+
+/**
+ * ExecutorTorch implementation of aoti_torch_mps_convolution.
+ * Performs 2D convolution operation - matches PyTorch AOTI signature
+ */
+AOTITorchError aoti_torch_mps_convolution(
+    AtenTensorHandle input,
+    AtenTensorHandle weight,
+    AtenTensorHandle* bias,
+    const int64_t* stride,
+    int64_t stride_len_,
+    const int64_t* padding,
+    int64_t padding_len_,
+    const int64_t* dilation,
+    int64_t dilation_len_,
+    int32_t transposed,
+    const int64_t* output_padding,
+    int64_t output_padding_len_,
+    int64_t groups,
+    AtenTensorHandle* ret0);
+
 // MetalShaderLibrary functions
 AOTITorchError aoti_torch_mps_create_shader_library(
     const char* metal_shader_source,
@@ -110,36 +151,6 @@ AOTITorchError aoti_torch_mps_synchronize_stream_with_type(int sync_type);
 AOTITorchError aoti_torch_mps_run_command_block(
     AOTIMetalKernelFunctionHandle func,
     std::function<void(AOTIMetalKernelFunctionHandle)> command_block);
-
-// Legacy operation-specific functions (preserved for backward compatibility)
-AOTITorchError aoti_torch_mps_addmm_out(
-    AtenTensorHandle out,
-    AtenTensorHandle self,
-    AtenTensorHandle mat1,
-    AtenTensorHandle mat2,
-    double beta,
-    double alpha);
-
-AOTITorchError aoti_torch_mps_mm_out(
-    AtenTensorHandle out,
-    AtenTensorHandle self,
-    AtenTensorHandle mat2);
-
-AOTITorchError aoti_torch_mps_convolution(
-    AtenTensorHandle input,
-    AtenTensorHandle weight,
-    AtenTensorHandle* bias,
-    const int64_t* stride,
-    int64_t stride_len_,
-    const int64_t* padding,
-    int64_t padding_len_,
-    const int64_t* dilation,
-    int64_t dilation_len_,
-    int32_t transposed,
-    const int64_t* output_padding,
-    int64_t output_padding_len_,
-    int64_t groups,
-    AtenTensorHandle* ret0);
 
 #endif
 
