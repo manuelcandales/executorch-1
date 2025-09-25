@@ -71,6 +71,14 @@ class Linear(torch.nn.Module):
         return self.linear(x)
 
 
+class Mm(torch.nn.Module):
+    def __init__(self):
+        super(Mm, self).__init__()
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
+        return x.mm(y)
+
+
 class SingleConv2d(nn.Module):
     def __init__(self):
         super(SingleConv2d, self).__init__()
@@ -291,6 +299,11 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "model_class": Add,
         "input_shapes": [(10,), (10,)],
         "description": "Simple tensor addition model",
+    },
+    "mm": {
+        "model_class": Mm,
+        "input_shapes": [(11, 45), (45, 8)],
+        "description": "Simple linear layer model",
     },
     "batchnorm": {
         "model_class": BatchNorm,
