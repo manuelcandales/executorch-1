@@ -22,6 +22,9 @@ namespace executorch {
 namespace backends {
 namespace aoti {
 
+// Forward declaration of dispatch_sync_with_rethrow from et_metal.mm
+void dispatch_sync_with_rethrow(dispatch_queue_t queue, void (^block)());
+
 // Declare the global mapping from et_metal.mm
 extern std::unordered_map<void*, id<MTLBuffer>> ptr_to_mtl_buffer;
 
@@ -39,177 +42,195 @@ AOTITorchError aoti_torch_mps_mm_out(
     return Error::InvalidArgument;
   }
 
-  @autoreleasepool {
-    try {
-      // Convert AOTITensorHandle to ExecutorTorch tensors
-      auto out_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(out);
-      auto self_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(self);
-      auto mat2_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(mat2);
+  // Use the same dispatch pattern as aoti_torch_mps_run_command_block for consistent synchronization
+  ETMetalStream* stream = getCurrentMetalStream();
+  if (!stream) {
+    ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to get current Metal stream");
+    return Error::Internal;
+  }
 
-      ET_LOG(Debug, "aoti_torch_mps_mm_out: Converted tensor handles to ET tensors");
+  try {
+    // Use dispatch_sync_with_rethrow to match custom kernel synchronization behavior
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+      @autoreleasepool {
+        // Convert AOTITensorHandle to ExecutorTorch tensors
+        auto out_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(out);
+        auto self_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(self);
+        auto mat2_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(mat2);
 
-      // Validate tensor dimensions
-      if (self_tensor->dim() != 2 || mat2_tensor->dim() != 2) {
-        ET_LOG(Error, "aoti_torch_mps_mm_out: tensors must be 2-D, got %d and %d",
-               (int)self_tensor->dim(), (int)mat2_tensor->dim());
-        return Error::InvalidArgument;
-      }
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: Converted tensor handles to ET tensors");
 
-      int64_t M = self_tensor->sizes()[0];  // rows of self
-      int64_t K = self_tensor->sizes()[1];  // cols of self / rows of mat2
-      int64_t N = mat2_tensor->sizes()[1];  // cols of mat2
+        // Validate tensor dimensions
+        if (self_tensor->dim() != 2 || mat2_tensor->dim() != 2) {
+          std::string error_msg = "aoti_torch_mps_mm_out: tensors must be 2-D, got " +
+                                 std::to_string(self_tensor->dim()) + " and " +
+                                 std::to_string(mat2_tensor->dim());
+          ET_LOG(Error, "%s", error_msg.c_str());
+          throw std::runtime_error(error_msg);
+        }
 
-      // Check matrix multiplication compatibility
-      if (self_tensor->sizes()[1] != mat2_tensor->sizes()[0]) {
-        ET_LOG(Error, "aoti_torch_mps_mm_out: incompatible matrix sizes for mm (%dx%d and %dx%d)",
-               (int)M, (int)K, (int)mat2_tensor->sizes()[0], (int)N);
-        return Error::InvalidArgument;
-      }
+        int64_t M = self_tensor->sizes()[0];  // rows of self
+        int64_t K = self_tensor->sizes()[1];  // cols of self / rows of mat2
+        int64_t N = mat2_tensor->sizes()[1];  // cols of mat2
 
-      // Log tensor shapes for debugging
-      ET_LOG(Debug, "aoti_torch_mps_mm_out: self shape: [%d, %d], mat2 shape: [%d, %d], out shape: [%d, %d]",
-             (int)M, (int)K, (int)mat2_tensor->sizes()[0], (int)N,
-             out_tensor->dim() > 0 ? (int)out_tensor->sizes()[0] : 0,
-             out_tensor->dim() > 1 ? (int)out_tensor->sizes()[1] : 0);
+        // Check matrix multiplication compatibility
+        if (self_tensor->sizes()[1] != mat2_tensor->sizes()[0]) {
+          std::string error_msg = "aoti_torch_mps_mm_out: incompatible matrix sizes for mm (" +
+                                 std::to_string(M) + "x" + std::to_string(K) + " and " +
+                                 std::to_string(mat2_tensor->sizes()[0]) + "x" + std::to_string(N) + ")";
+          ET_LOG(Error, "%s", error_msg.c_str());
+          throw std::runtime_error(error_msg);
+        }
 
-      // Get Metal device and stream
-      ETMetalStream* stream = getCurrentMetalStream();
-      id<MTLDevice> device = get_metal_device();
-      if (!device) {
-        ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to get Metal device");
-        return Error::Internal;
-      }
+        // Log tensor shapes for debugging
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: self shape: [%d, %d], mat2 shape: [%d, %d], out shape: [%d, %d]",
+               (int)M, (int)K, (int)mat2_tensor->sizes()[0], (int)N,
+               out_tensor->dim() > 0 ? (int)out_tensor->sizes()[0] : 0,
+               out_tensor->dim() > 1 ? (int)out_tensor->sizes()[1] : 0);
 
-      // Get Metal buffers from tensors using the global mapping
-      void* self_data_ptr = self_tensor->mutable_data_ptr();
-      void* mat2_data_ptr = mat2_tensor->mutable_data_ptr();
-      void* out_data_ptr = out_tensor->mutable_data_ptr();
+        // Get Metal device
+        id<MTLDevice> device = get_metal_device();
+        if (!device) {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to get Metal device");
+          throw std::runtime_error("Failed to get Metal device");
+        }
 
-      id<MTLBuffer> self_buffer = nullptr;
-      id<MTLBuffer> mat2_buffer = nullptr;
-      id<MTLBuffer> out_buffer = nullptr;
+        // Get Metal buffers from tensors using the global mapping
+        void* self_data_ptr = self_tensor->mutable_data_ptr();
+        void* mat2_data_ptr = mat2_tensor->mutable_data_ptr();
+        void* out_data_ptr = out_tensor->mutable_data_ptr();
 
-      // Look up Metal buffers from the global mapping
-      auto self_it = ptr_to_mtl_buffer.find(self_data_ptr);
-      auto mat2_it = ptr_to_mtl_buffer.find(mat2_data_ptr);
-      auto out_it = ptr_to_mtl_buffer.find(out_data_ptr);
+        id<MTLBuffer> self_buffer = nullptr;
+        id<MTLBuffer> mat2_buffer = nullptr;
+        id<MTLBuffer> out_buffer = nullptr;
 
-      if (self_it != ptr_to_mtl_buffer.end()) {
-        self_buffer = self_it->second;
-      }
-      if (mat2_it != ptr_to_mtl_buffer.end()) {
-        mat2_buffer = mat2_it->second;
-      }
-      if (out_it != ptr_to_mtl_buffer.end()) {
-        out_buffer = out_it->second;
-      }
+        // Look up Metal buffers from the global mapping
+        auto self_it = ptr_to_mtl_buffer.find(self_data_ptr);
+        auto mat2_it = ptr_to_mtl_buffer.find(mat2_data_ptr);
+        auto out_it = ptr_to_mtl_buffer.find(out_data_ptr);
 
-      // If buffers are not in Metal memory, create temporary Metal buffers
-      if (!self_buffer) {
-        size_t self_size = self_tensor->numel() * sizeof(float);
-        self_buffer = [device newBufferWithBytes:self_data_ptr
-                                          length:self_size
-                                         options:MTLResourceStorageModeShared];
+        if (self_it != ptr_to_mtl_buffer.end()) {
+          self_buffer = self_it->second;
+        }
+        if (mat2_it != ptr_to_mtl_buffer.end()) {
+          mat2_buffer = mat2_it->second;
+        }
+        if (out_it != ptr_to_mtl_buffer.end()) {
+          out_buffer = out_it->second;
+        }
+
+        // If buffers are not in Metal memory, create temporary Metal buffers
         if (!self_buffer) {
-          ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for self tensor");
-          return Error::Internal;
+          size_t self_size = self_tensor->numel() * sizeof(float);
+          self_buffer = [device newBufferWithBytes:self_data_ptr
+                                            length:self_size
+                                           options:MTLResourceStorageModeShared];
+          if (!self_buffer) {
+            ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for self tensor");
+            throw std::runtime_error("Failed to create Metal buffer for self tensor");
+          }
         }
-      }
 
-      if (!mat2_buffer) {
-        size_t mat2_size = mat2_tensor->numel() * sizeof(float);
-        mat2_buffer = [device newBufferWithBytes:mat2_data_ptr
-                                          length:mat2_size
-                                         options:MTLResourceStorageModeShared];
         if (!mat2_buffer) {
-          ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for mat2 tensor");
-          return Error::Internal;
+          size_t mat2_size = mat2_tensor->numel() * sizeof(float);
+          mat2_buffer = [device newBufferWithBytes:mat2_data_ptr
+                                            length:mat2_size
+                                           options:MTLResourceStorageModeShared];
+          if (!mat2_buffer) {
+            ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for mat2 tensor");
+            throw std::runtime_error("Failed to create Metal buffer for mat2 tensor");
+          }
         }
-      }
 
-      if (!out_buffer) {
-        size_t out_size = out_tensor->numel() * sizeof(float);
-        out_buffer = [device newBufferWithBytes:out_data_ptr
-                                         length:out_size
-                                        options:MTLResourceStorageModeShared];
         if (!out_buffer) {
-          ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for out tensor");
-          return Error::Internal;
+          size_t out_size = out_tensor->numel() * sizeof(float);
+          out_buffer = [device newBufferWithBytes:out_data_ptr
+                                           length:out_size
+                                          options:MTLResourceStorageModeShared];
+          if (!out_buffer) {
+            ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for out tensor");
+            throw std::runtime_error("Failed to create Metal buffer for out tensor");
+          }
         }
+
+        // End any existing kernel coalescing to ensure a clean state for MPS
+        stream->endKernelCoalescing();
+
+        // Get command buffer from stream (stream manages lifecycle)
+        id<MTLCommandBuffer> commandBuffer = stream->commandBuffer();
+        if (!commandBuffer) {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to get command buffer from stream");
+          throw std::runtime_error("Failed to get command buffer from stream");
+        }
+
+        // Create matrix descriptors for the multiplication
+        MPSMatrixDescriptor* selfDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
+                                                                              columns:K
+                                                                             matrices:1
+                                                                             rowBytes:K * sizeof(float)
+                                                                          matrixBytes:M * K * sizeof(float)
+                                                                             dataType:MPSDataTypeFloat32];
+
+        MPSMatrixDescriptor* mat2Desc = [MPSMatrixDescriptor matrixDescriptorWithRows:K
+                                                                              columns:N
+                                                                             matrices:1
+                                                                             rowBytes:N * sizeof(float)
+                                                                          matrixBytes:K * N * sizeof(float)
+                                                                             dataType:MPSDataTypeFloat32];
+
+        MPSMatrixDescriptor* outDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
+                                                                             columns:N
+                                                                            matrices:1
+                                                                            rowBytes:N * sizeof(float)
+                                                                         matrixBytes:M * N * sizeof(float)
+                                                                            dataType:MPSDataTypeFloat32];
+
+        MPSMatrix* selfMatrix = [[MPSMatrix alloc] initWithBuffer:self_buffer
+                                                           offset:0
+                                                       descriptor:selfDesc];
+
+        MPSMatrix* mat2Matrix = [[MPSMatrix alloc] initWithBuffer:mat2_buffer
+                                                           offset:0
+                                                       descriptor:mat2Desc];
+
+        MPSMatrix* outMatrix = [[MPSMatrix alloc] initWithBuffer:out_buffer
+                                                          offset:0
+                                                      descriptor:outDesc];
+
+        // Create matrix multiplication kernel
+        MPSMatrixMultiplication* matmul = [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                                                           transposeLeft:NO
+                                                                          transposeRight:NO
+                                                                              resultRows:M
+                                                                           resultColumns:N
+                                                                        interiorColumns:K
+                                                                                   alpha:1.0
+                                                                                    beta:0.0];
+
+        // Encode the matrix multiplication
+        [matmul encodeToCommandBuffer:commandBuffer
+                           leftMatrix:selfMatrix
+                          rightMatrix:mat2Matrix
+                         resultMatrix:outMatrix];
+
+        // Clean up MPS objects
+        [selfMatrix release];
+        [mat2Matrix release];
+        [outMatrix release];
+        [matmul release];
+
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: Matrix multiplication completed successfully with synchronization");
       }
+    });
 
-      // End any existing kernel coalescing to ensure a clean state for MPS
-      stream->endKernelCoalescing();
+    return Error::Ok;
 
-      // Get command buffer from stream (stream manages lifecycle)
-      id<MTLCommandBuffer> commandBuffer = stream->commandBuffer();
-
-      // Create matrix descriptors for the multiplication
-      MPSMatrixDescriptor* selfDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
-                                                                            columns:K
-                                                                           matrices:1
-                                                                           rowBytes:K * sizeof(float)
-                                                                        matrixBytes:M * K * sizeof(float)
-                                                                           dataType:MPSDataTypeFloat32];
-
-      MPSMatrixDescriptor* mat2Desc = [MPSMatrixDescriptor matrixDescriptorWithRows:K
-                                                                            columns:N
-                                                                           matrices:1
-                                                                           rowBytes:N * sizeof(float)
-                                                                        matrixBytes:K * N * sizeof(float)
-                                                                           dataType:MPSDataTypeFloat32];
-
-      MPSMatrixDescriptor* outDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
-                                                                           columns:N
-                                                                          matrices:1
-                                                                          rowBytes:N * sizeof(float)
-                                                                       matrixBytes:M * N * sizeof(float)
-                                                                          dataType:MPSDataTypeFloat32];
-
-      MPSMatrix* selfMatrix = [[MPSMatrix alloc] initWithBuffer:self_buffer
-                                                         offset:0
-                                                     descriptor:selfDesc];
-
-      MPSMatrix* mat2Matrix = [[MPSMatrix alloc] initWithBuffer:mat2_buffer
-                                                         offset:0
-                                                     descriptor:mat2Desc];
-
-      MPSMatrix* outMatrix = [[MPSMatrix alloc] initWithBuffer:out_buffer
-                                                        offset:0
-                                                    descriptor:outDesc];
-
-      // Create matrix multiplication kernel
-      MPSMatrixMultiplication* matmul = [[MPSMatrixMultiplication alloc] initWithDevice:device
-                                                                         transposeLeft:NO
-                                                                        transposeRight:NO
-                                                                            resultRows:M
-                                                                         resultColumns:N
-                                                                      interiorColumns:K
-                                                                                 alpha:1.0
-                                                                                  beta:0.0];
-
-      // Encode the matrix multiplication (stream will handle commit/synchronization)
-      [matmul encodeToCommandBuffer:commandBuffer
-                         leftMatrix:selfMatrix
-                        rightMatrix:mat2Matrix
-                       resultMatrix:outMatrix];
-
-      // Clean up MPS objects
-      [selfMatrix release];
-      [mat2Matrix release];
-      [outMatrix release];
-      [matmul release];
-
-      ET_LOG(Debug, "aoti_torch_mps_mm_out: Matrix multiplication completed successfully");
-      return Error::Ok;
-
-    } catch (const std::exception& e) {
-      ET_LOG(Error, "aoti_torch_mps_mm_out exception: %s", e.what());
-      return Error::Internal;
-    } catch (...) {
-      ET_LOG(Error, "aoti_torch_mps_mm_out: unknown exception");
-      return Error::Internal;
-    }
+  } catch (const std::exception& e) {
+    ET_LOG(Error, "aoti_torch_mps_mm_out exception: %s", e.what());
+    return Error::Internal;
+  } catch (...) {
+    ET_LOG(Error, "aoti_torch_mps_mm_out: unknown exception");
+    return Error::Internal;
   }
 }
 

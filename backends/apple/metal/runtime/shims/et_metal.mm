@@ -13,14 +13,34 @@
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include "et_metal.h"
 #include <algorithm>
+#include <optional>
+#include <exception>
 
 namespace executorch {
 namespace backends {
 namespace aoti {
 
 // =======================
-// Global Variables and Storage
+// Exception-Safe Dispatch Function (similar to PyTorch MPS)
 // =======================
+
+void dispatch_sync_with_rethrow(dispatch_queue_t queue, void (^block)()) {
+    __block std::optional<std::exception_ptr> block_exception;
+    dispatch_sync(queue, ^() {
+        try {
+            block();
+        } catch (...) {
+            block_exception = std::current_exception();
+        }
+    });
+    if (block_exception) {
+        std::rethrow_exception(*block_exception);
+    }
+}
+
+// =======================
+// Global Variables and Storage
+// ================
 
 
 // Global Metal buffer mapping - accessible for MPS shim
@@ -445,14 +465,16 @@ void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, s
 }
 
 void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
-    @autoreleasepool {
-        // Don't require an active encoder here - let the callback set it up
-        // This is needed for AOTI compatibility where startEncoding is called inside the callback
+    // Use dispatch_sync with the stream's serial queue for thread safety and synchronization
+    // This matches PyTorch's approach: dispatch_sync_with_rethrow(getCurrentMPSStream()->queue(), ...)
+    ETMetalStream* stream = getCurrentMetalStream();
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+        @autoreleasepool {
+            f();
+        }
+    });
 
-        f();
-
-        ET_LOG(Debug, "ETMetalKernelFunction::runCommandBlock: Executed command block");
-    }
+    ET_LOG(Debug, "ETMetalKernelFunction::runCommandBlock: Executed command block with dispatch_sync");
 }
 
 // =======================
@@ -576,39 +598,36 @@ id<MTLComputeCommandEncoder> ETMetalStream::commandEncoder() {
     return commandEncoder_;
 }
 
-// Synchronization with SyncType
+// Synchronization with SyncType - matches PyTorch's approach (no dispatch_sync here)
 void ETMetalStream::synchronize(SyncType syncType) {
-    dispatch_sync(serialQueue_, ^{
-        @autoreleasepool {
-            endKernelCoalescing();
+    endKernelCoalescing();
 
-            switch (syncType) {
-                case SyncType::NONE:
-                    // Do nothing - no commit
-                    break;
-                case SyncType::COMMIT:
-                    commit();
-                    break;
-                case SyncType::COMMIT_AND_WAIT:
-                    commitAndWait();
-                    break;
-                case SyncType::COMMIT_AND_CONTINUE:
-                    if (enableCommitAndContinue_) {
-                        commitAndContinue();
-                    } else {
-                        ET_LOG(Error, "ETMetalStream::synchronize: CommitAndContinue requested but disabled");
-                        commit();
-                    }
-                    break;
-                case SyncType::COMMIT_ADAPTIVE:
-                    // Simple adaptive policy - could be enhanced with memory pressure detection
-                    commit();
-                    break;
+    switch (syncType) {
+        case SyncType::NONE:
+            // Do nothing - no commit
+            break;
+        case SyncType::COMMIT:
+            commit();
+            break;
+        case SyncType::COMMIT_AND_WAIT:
+            commitAndWait();
+            break;
+        case SyncType::COMMIT_AND_CONTINUE:
+            if (enableCommitAndContinue_) {
+                commitAndContinue();
+            } else {
+                ET_LOG(Error, "ETMetalStream::synchronize: CommitAndContinue requested but disabled");
+                commit();
             }
+            break;
+        case SyncType::COMMIT_ADAPTIVE:
+            // Simple adaptive policy - could be enhanced with memory pressure detection
+            // TODO: Could add memory pressure detection like PyTorch does
+            commit();
+            break;
+    }
 
-            ET_LOG(Debug, "ETMetalStream::synchronize: Completed with SyncType %d", static_cast<int>(syncType));
-        }
-    });
+    ET_LOG(Debug, "ETMetalStream::synchronize: Completed with SyncType %d", static_cast<int>(syncType));
 }
 
 // Encoder coalescing management
