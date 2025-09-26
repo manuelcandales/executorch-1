@@ -119,7 +119,7 @@ AOTITorchError aoti_torch_create_tensor_from_blob_v2(
   // Handle storage offset by adjusting the data pointer
   void* adjusted_data = static_cast<char*>(data) + (storage_offset * dtype_to_element_size(dtype));
 
-  ET_LOG(Debug, "aoti_torch_create_tensor_from_blob_v2: original_data=%p, storage_offset=%ld, element_size=%zu, adjusted_data=%p",
+  ET_LOG(Debug, "aoti_torch_create_tensor_from_blob_v2: original_data=%p, storage_offset=%lld, element_size=%zu, adjusted_data=%p",
          data, storage_offset, dtype_to_element_size(dtype), adjusted_data);
 
   // Convert sizes to the format expected by ExecutorTorch
@@ -169,7 +169,7 @@ AOTITorchError aoti_torch_create_tensor_from_blob_v2(
         strides[i] = 1;
         adjusted_sizes[i] = 1;  // Broadcast dimensions have effective size 1
         has_broadcast_dims = true;
-        ET_LOG(Debug, "aoti_torch_create_tensor_from_blob_v2: Converted broadcast dim %d: stride 0->1, size %ld->1", i, size);
+        ET_LOG(Debug, "aoti_torch_create_tensor_from_blob_v2: Converted broadcast dim %d: stride 0->1, size %lld->1", i, size);
       } else {
         strides[i] = static_cast<int32_t>(original_stride);
         adjusted_sizes[i] = static_cast<int32_t>(size);
@@ -271,7 +271,7 @@ AOTITorchError aoti_torch_empty_strided(
   if (device_type == 2) { // Metal/MPS
     ptr = metal_allocate_buffer(nbytes);
     if (!ptr) {
-      ET_LOG(Error, "Failed to allocate %ld bytes on Metal device", nbytes);
+      ET_LOG(Error, "Failed to allocate %lld bytes on Metal device", nbytes);
       return Error::MemoryAllocationFailed;
     }
   } else if (device_type == 0) { // cpu
@@ -285,7 +285,7 @@ AOTITorchError aoti_torch_empty_strided(
       ET_LOG(Error, "Failed to call posix_memalign");
       return Error::MemoryAllocationFailed;
     }
-    ET_LOG(Debug, "Allocated %ld bytes on CPU", nbytes);
+    ET_LOG(Debug, "Allocated %lld bytes on CPU", nbytes);
   } else {
     ET_LOG(
         Error,
@@ -376,7 +376,7 @@ AOTITorchError aoti_torch_copy_(
   if (self->dim() != src->dim()) {
     ET_LOG(
         Error,
-        "dimension mismatch. self.dim()=%d, src.dim()=%d",
+        "dimension mismatch. self.dim()=%zd, src.dim()=%zd",
         self->dim(),
         src->dim());
     return Error::InvalidArgument;
@@ -649,7 +649,7 @@ AOTITorchError aoti_torch__reinterpret_tensor(
     int64_t storage_offset,
     AOTITensorHandle* ret_new_tensor) {
 
-  ET_LOG(Debug, "aoti_torch__reinterpret_tensor: self->dim()=%d, ndim=%ld, storage_offset=%ld",
+  ET_LOG(Debug, "aoti_torch__reinterpret_tensor: self->dim()=%zd, ndim=%lld, storage_offset=%lld",
          self->dim(), ndim, storage_offset);
 
   // Get tensor properties from the input tensor
@@ -683,7 +683,7 @@ AOTITorchError aoti_torch__reinterpret_tensor(
     new_numel *= sizes_ptr[i];
   }
 
-  ET_LOG(Debug, "aoti_torch__reinterpret_tensor: base_data_ptr=%p, new_numel=%ld, storage_offset=%ld",
+  ET_LOG(Debug, "aoti_torch__reinterpret_tensor: base_data_ptr=%p, new_numel=%lld, storage_offset=%lld",
          base_data_ptr, new_numel, storage_offset);
 
   // Create a new tensor view that shares the same underlying storage

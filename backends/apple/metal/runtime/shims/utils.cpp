@@ -101,7 +101,7 @@ AOTITorchError validate_storage_offset(int64_t storage_offset) {
   if (storage_offset != 0) {
     ET_LOG(
         Error,
-        "Storage offset must be 0. Got storage_offset: %ld",
+        "Storage offset must be 0. Got storage_offset: %lld",
         storage_offset);
     return Error::InvalidArgument;
   }
