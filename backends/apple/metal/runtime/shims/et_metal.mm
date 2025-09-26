@@ -8,6 +8,7 @@
 
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #import <Foundation/Foundation.h>
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
@@ -756,6 +757,23 @@ void ETMetalStream::synchronize() {
 
 bool ETMetalStream::isEmpty() const {
     return !commandBuffer_ && !commandEncoder_;
+}
+
+void ETMetalStream::executeMPSGraph(MPSGraph* mpsGraph, NSDictionary* feeds, NSDictionary* results, SyncType syncType) {
+    // Use dispatch_sync_with_rethrow exactly like PyTorch does for MPSGraph execution
+    dispatch_sync_with_rethrow(serialQueue_, ^() {
+        @autoreleasepool {
+            endKernelCoalescing();
+
+            [mpsGraph encodeToCommandBuffer:commandBuffer()
+                                      feeds:feeds
+                           targetOperations:nil
+                          resultsDictionary:results
+                        executionDescriptor:nil];
+
+            synchronize(syncType);
+        }
+    });
 }
 
 // =======================

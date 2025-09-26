@@ -12,6 +12,10 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <dispatch/dispatch.h>
+
+// Forward declarations for MetalPerformanceShadersGraph types
+@class MPSGraph;
+
 #else
 // Forward declarations for C++ compilation
 typedef void* MTLDevice_t;
@@ -23,6 +27,7 @@ typedef void* MTLFunction_t;
 typedef void* MTLLibrary_t;
 typedef void* MTLBuffer_t;
 typedef void* dispatch_queue_t;
+typedef void* MPSGraph;
 #endif
 
 #include <unordered_map>
@@ -150,6 +155,9 @@ public:
     void synchronize(SyncType syncType = SyncType::COMMIT_AND_WAIT);
     void synchronize(); // Overload for backward compatibility
     void endKernelCoalescing();
+
+    // MPSGraph execution
+    void executeMPSGraph(MPSGraph* mpsGraph, NSDictionary* feeds, NSDictionary* results, SyncType syncType = SyncType::COMMIT_ADAPTIVE);
 
     // Command buffer lifecycle management
     void commitCommandBuffer(id<MTLCommandBuffer> commandBuffer);
