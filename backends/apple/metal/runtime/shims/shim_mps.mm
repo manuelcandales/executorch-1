@@ -497,12 +497,19 @@ AOTITorchError aoti_torch_mps_synchronize_stream_with_type(int sync_type) {
     }
 }
 
-} // extern "C"
+// Shared callback function for std::function trampoline
+void aoti_torch_mps_shared_callback(
+    AOTIMetalKernelFunctionHandle func,
+    void* user_data) {
+    auto* function_wrapper = static_cast<std::function<void(AOTIMetalKernelFunctionHandle)>*>(user_data);
+    (*function_wrapper)(func);
+}
 
-// C++ only functions
+// Pure C version using function pointer and user data for trampoline pattern
 AOTITorchError aoti_torch_mps_run_command_block(
     AOTIMetalKernelFunctionHandle func,
-    std::function<void(AOTIMetalKernelFunctionHandle)> command_block) {
+    aoti_torch_mps_command_block_callback_t callback,
+    void* user_data) {
 
     if (!func) {
         ET_LOG(Error, "aoti_torch_mps_run_command_block: null function handle");
@@ -511,8 +518,8 @@ AOTITorchError aoti_torch_mps_run_command_block(
 
     try {
         auto* function = reinterpret_cast<ETMetalKernelFunction*>(func);
-        function->runCommandBlock([&command_block, func]() {
-            command_block(func);
+        function->runCommandBlock([callback, func, user_data]() {
+            callback(func, user_data);
         });
 
         ET_LOG(Debug, "aoti_torch_mps_run_command_block: Executed command block for function %p", function);
@@ -526,6 +533,8 @@ AOTITorchError aoti_torch_mps_run_command_block(
         return Error::Internal;
     }
 }
+
+} // extern "C"
 
 
 } // namespace aoti
