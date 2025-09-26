@@ -446,10 +446,8 @@ void ETMetalKernelFunction::dispatchArrayWithGroupSize(const uint64_t* length, s
 
 void ETMetalKernelFunction::runCommandBlock(std::function<void(void)> f) {
     @autoreleasepool {
-        if (!encoder_) {
-            ET_LOG(Error, "ETMetalKernelFunction::runCommandBlock: No active encoder");
-            return;
-        }
+        // Don't require an active encoder here - let the callback set it up
+        // This is needed for AOTI compatibility where startEncoding is called inside the callback
 
         f();
 

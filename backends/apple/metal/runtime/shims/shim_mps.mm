@@ -501,8 +501,16 @@ AOTITorchError aoti_torch_mps_synchronize_stream_with_type(int sync_type) {
 void aoti_torch_mps_shared_callback(
     AOTIMetalKernelFunctionHandle func,
     void* user_data) {
+    ET_LOG(Debug, "aoti_torch_mps_shared_callback: Called with func=%p, user_data=%p", func, user_data);
+
     auto* function_wrapper = static_cast<std::function<void(AOTIMetalKernelFunctionHandle)>*>(user_data);
-    (*function_wrapper)(func);
+    if (function_wrapper) {
+        ET_LOG(Debug, "aoti_torch_mps_shared_callback: Calling function wrapper");
+        (*function_wrapper)(func);
+        ET_LOG(Debug, "aoti_torch_mps_shared_callback: Function wrapper completed");
+    } else {
+        ET_LOG(Error, "aoti_torch_mps_shared_callback: null function wrapper");
+    }
 }
 
 // Pure C version using function pointer and user data for trampoline pattern
@@ -516,10 +524,20 @@ AOTITorchError aoti_torch_mps_run_command_block(
         return Error::InvalidArgument;
     }
 
+    if (!callback) {
+        ET_LOG(Error, "aoti_torch_mps_run_command_block: null callback");
+        return Error::InvalidArgument;
+    }
+
+    ET_LOG(Debug, "aoti_torch_mps_run_command_block: Starting command block for function %p, callback %p, user_data %p",
+           func, callback, user_data);
+
     try {
         auto* function = reinterpret_cast<ETMetalKernelFunction*>(func);
         function->runCommandBlock([callback, func, user_data]() {
+            ET_LOG(Debug, "aoti_torch_mps_run_command_block: Inside lambda, calling callback");
             callback(func, user_data);
+            ET_LOG(Debug, "aoti_torch_mps_run_command_block: Callback completed");
         });
 
         ET_LOG(Debug, "aoti_torch_mps_run_command_block: Executed command block for function %p", function);
