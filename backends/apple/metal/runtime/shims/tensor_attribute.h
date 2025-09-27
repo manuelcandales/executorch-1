@@ -67,6 +67,9 @@ int32_t aoti_torch_dtype_float32();
 int32_t aoti_torch_grad_mode_is_enabled();
 void aoti_torch_grad_mode_set_enabled(bool enabled);
 
+// AOTI compatibility functions
+size_t aoti_torch_dtype_element_size(int32_t dtype);
+
 // Cleanup function for clearing global state
 void cleanup_tensor_metadata();
 
