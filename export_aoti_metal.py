@@ -79,6 +79,15 @@ class Mm(torch.nn.Module):
         return x.mm(y)
 
 
+class MmWeights(torch.nn.Module):
+    def __init__(self):
+        super(MmWeights, self).__init__()
+        self.weight = nn.Parameter(torch.arange(20, dtype=torch.float).reshape(4, 5))
+
+    def forward(self, x: torch.Tensor):
+        return x.mm(self.weight)
+
+
 class SingleConv2d(nn.Module):
     def __init__(self):
         super(SingleConv2d, self).__init__()
@@ -313,7 +322,12 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "mm": {
         "model_class": Mm,
-        "input_shapes": [(11, 45), (45, 8)],
+        "input_shapes": [(3, 4), (4, 5)],
+        "description": "Simple mm layer model",
+    },
+    "mm_weights": {
+        "model_class": MmWeights,
+        "input_shapes": [(3, 4)],
         "description": "Simple mm layer model",
     },
     "elementwise_mm_reduction": {

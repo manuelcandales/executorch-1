@@ -340,8 +340,13 @@ AOTITorchError aoti_torch_mps_malloc(void** buffer, size_t num_bytes) {
                 return Error::Internal;
             }
 
-            *buffer = (void*)metal_buffer;
-            ET_LOG(Debug, "aoti_torch_mps_malloc: Allocated Metal buffer %p of size %zu", metal_buffer, num_bytes);
+            // FIX: Return contents pointer, not buffer object
+            void* contents_ptr = [metal_buffer contents];
+            ptr_to_mtl_buffer[contents_ptr] = metal_buffer;  // Map contents to buffer
+            *buffer = contents_ptr;  // Return contents pointer
+
+            ET_LOG(Debug, "aoti_torch_mps_malloc: Allocated Metal buffer %p with contents %p of size %zu",
+                   metal_buffer, contents_ptr, num_bytes);
             return Error::Ok;
 
         } catch (const std::exception& e) {
@@ -361,10 +366,19 @@ AOTITorchError aoti_torch_mps_free(void* ptr) {
 
     @autoreleasepool {
         try {
-            auto metal_buffer = (id<MTLBuffer>)ptr;
-            [metal_buffer release];
+            // FIX: ptr is now the contents pointer, not the buffer object
+            // Look up the buffer from the mapping and clean up
+            auto it = ptr_to_mtl_buffer.find(ptr);
+            if (it != ptr_to_mtl_buffer.end()) {
+                id<MTLBuffer> metal_buffer = it->second;
+                [metal_buffer release];
+                ptr_to_mtl_buffer.erase(it);
+                ET_LOG(Debug, "aoti_torch_mps_free: Freed Metal buffer for contents %p", ptr);
+            } else {
+                ET_LOG(Error, "aoti_torch_mps_free: Buffer not found for contents pointer %p", ptr);
+                return Error::InvalidArgument;
+            }
 
-            ET_LOG(Debug, "aoti_torch_mps_free: Freed Metal buffer %p", ptr);
             return Error::Ok;
 
         } catch (const std::exception& e) {
@@ -391,13 +405,8 @@ AOTITorchError aoti_torch_mps_memcpy(
 
     @autoreleasepool {
         try {
-            auto metal_buffer = (id<MTLBuffer>)buffer;
-            auto buffer_pointer = static_cast<uint8_t*>([metal_buffer contents]);
-
-            if (!buffer_pointer) {
-                ET_LOG(Error, "aoti_torch_mps_memcpy: Failed to get buffer contents");
-                return Error::Internal;
-            }
+            // FIX: buffer is now the contents pointer, not the buffer object
+            auto buffer_pointer = static_cast<uint8_t*>(buffer);
 
             memcpy(buffer_pointer + constant_offset, constants_start + bytes_read, data_size);
 
