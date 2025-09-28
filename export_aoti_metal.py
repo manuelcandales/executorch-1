@@ -88,6 +88,47 @@ class MmWeights(torch.nn.Module):
         return x.mm(self.weight)
 
 
+class Linear2(torch.nn.Module):
+    def __init__(self):
+        super(Linear2, self).__init__()
+        self.linear = nn.Linear(7, 6)
+        self.linear.weight = nn.Parameter(torch.arange(42, dtype=torch.float).reshape(6, 7))
+        self.linear.bias = nn.Parameter(torch.arange(6, dtype=torch.float))
+
+    def forward(self, x: torch.Tensor):
+        return self.linear(x)
+
+
+class Addmm(torch.nn.Module):
+    def __init__(self):
+        super(Addmm, self).__init__()
+        self.linear_weight = nn.Parameter(torch.transpose_copy(torch.arange(42, dtype=torch.float).reshape(6, 7), 0, 1))
+        self.linear_bias = nn.Parameter(torch.arange(6, dtype=torch.float))
+
+    def forward(self, x: torch.Tensor):
+        return torch.addmm(self.linear_bias, x, self.linear_weight)
+
+
+class TwoMm(torch.nn.Module):
+    def __init__(self):
+        super(TwoMm, self).__init__()
+        self.left_weight = nn.Parameter(torch.arange(20, dtype=torch.float).reshape(4, 5))
+        self.right_weight = nn.Parameter(torch.arange(42, dtype=torch.float).reshape(6, 7))
+
+    def forward(self, x: torch.Tensor):
+        return self.left_weight.mm(x).mm(self.right_weight)
+
+
+class Addmm2(torch.nn.Module):
+    def __init__(self):
+        super(Addmm2, self).__init__()
+        self.linear_weight = nn.Parameter(torch.transpose_copy(torch.arange(42, dtype=torch.float).reshape(6, 7), 0, 1))
+        self.linear_bias = nn.Parameter(torch.arange(6, dtype=torch.float))
+
+    def forward(self, x: torch.Tensor):
+        return x.mm(self.linear_weight) + self.linear_bias
+
+
 class SingleConv2d(nn.Module):
     def __init__(self):
         super(SingleConv2d, self).__init__()
@@ -303,6 +344,26 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "linear": {
         "model_class": Linear,
         "input_shapes": [(127, 7)],
+        "description": "Simple linear layer model",
+    },
+    "linear2": {
+        "model_class": Linear2,
+        "input_shapes": [(2, 7)],
+        "description": "Simple linear layer model",
+    },
+    "addmm": {
+        "model_class": Addmm,
+        "input_shapes": [(2, 7)],
+        "description": "Simple linear layer model",
+    },
+    "addmm2": {
+        "model_class": Addmm2,
+        "input_shapes": [(2, 7)],
+        "description": "Simple linear layer model",
+    },
+    "2mm": {
+        "model_class": TwoMm,
+        "input_shapes": [(5, 6)],
         "description": "Simple linear layer model",
     },
     "conv2d": {
