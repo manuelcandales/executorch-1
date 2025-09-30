@@ -30,6 +30,7 @@ supported_fallback_kernels: Dict[str, Any] = {
     "aoti_torch_mps_addmm_out": None,
     "aoti_torch_mps_convolution": None,
     "aoti_torch_mps_mm_out": None,
+    "at::_ops::_scaled_dot_product_attention_math_for_mps::call": None,
 }
 
 # required fallback kernels but not supported
@@ -78,20 +79,18 @@ class MetalBackend(BackendDetails):
         edge_program: ExportedProgram,
         compile_specs: List[CompileSpec],
     ) -> PreprocessResult:
-
         print("entering the lowerable parts in MetalBackend.preprocess....")
-        named_data_store = NamedDataStore()
+        # Move the edge_program from CPU to MPS for aoti compile
+        mps_edge_program = move_to_device_pass(edge_program, "mps")
 
-        target_device = "mps"
-        blob_suffix = "metal"
+        edge_program_module = mps_edge_program.module()
 
-        # Make a deep copy to avoid modifying the original
-        copy_edge_program = copy.deepcopy(edge_program)
-
-        # Move the edge_program to the appropriate device
-        copy_edge_program = move_to_device_pass(copy_edge_program, target_device)
-        edge_program_module = copy_edge_program.module()
-        args, kwargs = copy_edge_program.example_inputs
+        # Grab all input placeholders from the graph
+        user_input_names = mps_edge_program.graph_signature.user_inputs
+        user_input_placeholders = []
+        for node in mps_edge_program.graph.nodes:
+            if node.op == "placeholder" and node.name in user_input_names:
+                user_input_placeholders.append(node.meta["val"])
 
         output_path = os.path.join(os.getcwd(), "aoti.so")
 
@@ -110,7 +109,7 @@ class MetalBackend(BackendDetails):
         }
 
         with collect_unsupported_fallback_kernels():
-            so_path = torch._inductor.aot_compile(edge_program_module, args, kwargs, options=options)  # type: ignore[arg-type]
+            so_path = torch._inductor.aot_compile(edge_program_module, tuple(user_input_placeholders), options=options)  # type: ignore[arg-type]
             if len(missing_fallback_kernels) > 0:
                 formatted_kernels = "\n  - ".join(sorted(missing_fallback_kernels))
                 raise RuntimeError(
@@ -126,8 +125,12 @@ class MetalBackend(BackendDetails):
             so_data = f.read()
 
         # Use device-specific blob name
-        named_data_store.add_named_data("so_blob", so_data, 1, f"aoti_{blob_suffix}_blob")
+        named_data_store = NamedDataStore()
+        named_data_store.add_named_data("so_blob", so_data, 1, f"aoti_metal_blob")
 
+        # Clean up the generated so file; it has been packaged into the NamdeDataStore
+        # pyre-ignorep[6]: Incompatible parameter type
+        os.remove(so_path)
 
         return PreprocessResult(
             processed_bytes=b"",
