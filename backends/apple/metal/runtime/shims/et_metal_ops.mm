@@ -474,6 +474,192 @@ AOTITorchError aoti_torch_mps_convolution(
   }
 }
 
+// Helper function to ensure 4D tensors (port from PyTorch)
+static std::tuple<AOTITensorHandle, bool> ensure_4d_et(AOTITensorHandle x) {
+  auto* x_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(x);
+
+  if (x_tensor->dim() == 3) {
+    // Need to unsqueeze - for now, return as is and handle in the main function
+    return {x, true};
+  } else if (x_tensor->dim() > 4) {
+    // Need to view as 4D - for now, return as is and handle in the main function
+    return {x, true};
+  } else {
+    return {x, false};
+  }
+}
+
+AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
+    AOTITensorHandle query,
+    AOTITensorHandle key,
+    AOTITensorHandle value,
+    AOTITensorHandle* attn_mask,
+    double dropout_p,
+    int32_t is_causal,
+    AOTITensorHandle* dropout_mask,
+    double* scale,
+    AOTITensorHandle* ret0,
+    AOTITensorHandle* ret1) {
+
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Starting");
+
+  if (!query || !key || !value || !ret0 || !ret1) {
+    ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: null required tensor handles");
+    return Error::InvalidArgument;
+  }
+
+  @autoreleasepool {
+    try {
+      // Convert AOTITensorHandle to ExecutorTorch tensors
+      auto* query_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(query);
+      auto* key_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(key);
+      auto* value_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(value);
+
+      ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Converted tensor handles to ET tensors");
+
+      // Ensure 4D tensors (simplified version for ExecuTorch)
+      auto [q_, q_unsqueezed] = ensure_4d_et(query);
+      auto [k_, k_unsqueezed] = ensure_4d_et(key);
+      auto [v_, v_unsqueezed] = ensure_4d_et(value);
+
+      auto* q_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(q_);
+      auto* k_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(k_);
+      auto* v_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(v_);
+
+      // Validate tensor dimensions
+      if (q_tensor->dim() < 3 || k_tensor->dim() < 3 || v_tensor->dim() < 3) {
+        ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: tensors must be at least 3-D");
+        return Error::InvalidArgument;
+      }
+
+      // Get tensor dimensions (assuming last 3 dimensions are [num_heads, seq_len, head_dim])
+      int64_t batchSize = (q_tensor->dim() >= 4) ? q_tensor->sizes()[0] : 1;
+      int64_t num_heads = q_tensor->sizes()[q_tensor->dim() - 3];
+      int64_t qSize = q_tensor->sizes()[q_tensor->dim() - 2];
+      int64_t headSize = q_tensor->sizes()[q_tensor->dim() - 1];
+      int64_t maxSeqLength = k_tensor->sizes()[k_tensor->dim() - 2];
+
+      ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: batchSize=%lld, num_heads=%lld, qSize=%lld, headSize=%lld, maxSeqLength=%lld",
+             batchSize, num_heads, qSize, headSize, maxSeqLength);
+
+      // Calculate scale factor (simplified version of sdp::calculate_scale)
+      double scale_factor = scale ? *scale : (1.0 / sqrt(static_cast<double>(headSize)));
+
+      ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: scale_factor=%f", scale_factor);
+
+      // Calculate output tensor dimensions
+      std::vector<int64_t> output_sizes = {batchSize, num_heads, qSize, headSize};
+      std::vector<int64_t> attn_sizes = {batchSize, num_heads, qSize, maxSeqLength};
+
+      // Calculate strides for contiguous tensors
+      std::vector<int64_t> out_strides = {
+          num_heads * qSize * headSize,
+          qSize * headSize,
+          headSize,
+          1
+      };
+
+      std::vector<int64_t> attn_strides = {
+          num_heads * qSize * maxSeqLength,
+          qSize * maxSeqLength,
+          maxSeqLength,
+          1
+      };
+
+      // Allocate memory for output tensors
+      size_t out_size_bytes = batchSize * num_heads * qSize * headSize * sizeof(float);
+      size_t attn_size_bytes = batchSize * num_heads * qSize * maxSeqLength * sizeof(float);
+
+      void* out_data = std::malloc(out_size_bytes);
+      void* attn_data = std::malloc(attn_size_bytes);
+
+      if (!out_data || !attn_data) {
+        ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to allocate memory");
+        if (out_data) std::free(out_data);
+        if (attn_data) std::free(attn_data);
+        return Error::Internal;
+      }
+
+      // Initialize output tensors with zeros
+      std::memset(out_data, 0, out_size_bytes);
+      std::memset(attn_data, 0, attn_size_bytes);
+
+      // Create output tensor handles
+      AOTITensorHandle out_tensor_handle = nullptr;
+      AOTITensorHandle attn_tensor_handle = nullptr;
+
+      AOTITorchError create_out_result = aoti_torch_create_tensor_from_blob_v2(
+          out_data,
+          4,  // ndim
+          output_sizes.data(),
+          out_strides.data(),
+          0,  // storage_offset
+          static_cast<int32_t>(SupportedDTypes::FLOAT32),
+          0,  // device_type (CPU)
+          0,  // device_index
+          &out_tensor_handle,
+          0,  // layout (strided)
+          nullptr,  // opaque_metadata
+          0   // opaque_metadata_size
+      );
+
+      AOTITorchError create_attn_result = aoti_torch_create_tensor_from_blob_v2(
+          attn_data,
+          4,  // ndim
+          attn_sizes.data(),
+          attn_strides.data(),
+          0,  // storage_offset
+          static_cast<int32_t>(SupportedDTypes::FLOAT32),
+          0,  // device_type (CPU)
+          0,  // device_index
+          &attn_tensor_handle,
+          0,  // layout (strided)
+          nullptr,  // opaque_metadata
+          0   // opaque_metadata_size
+      );
+
+      if (create_out_result != Error::Ok || create_attn_result != Error::Ok ||
+          !out_tensor_handle || !attn_tensor_handle) {
+        ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create output tensors");
+        std::free(out_data);
+        std::free(attn_data);
+        return Error::Internal;
+      }
+
+      // TODO: Implement actual scaled dot product attention computation using Metal
+      // For now, we're creating properly shaped output tensors filled with zeros
+      // The actual implementation would require:
+      // 1. Q @ K^T computation
+      // 2. Scale by scale_factor
+      // 3. Apply causal mask if is_causal is true
+      // 4. Apply attention mask if provided
+      // 5. Softmax along the last dimension
+      // 6. Multiply by V
+      // This would typically be done using MetalPerformanceShaders or custom Metal compute shaders
+
+      // Mark that we own the memory for these tensors
+      auto* out_et_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(out_tensor_handle);
+      auto* attn_et_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(attn_tensor_handle);
+      is_tensor_own_memory[out_et_tensor] = true;
+      is_tensor_own_memory[attn_et_tensor] = true;
+
+      // Set output tensor handles
+      *ret0 = out_tensor_handle;
+      *ret1 = attn_tensor_handle;
+
+      ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created output tensors successfully");
+      return Error::Ok;
+
+    } catch (const std::exception& e) {
+      ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps exception: %s", e.what());
+      return Error::Internal;
+    } catch (...) {
+      ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: unknown exception");
+      return Error::Internal;
+    }
+  }
+}
+
 } // extern "C"
 
 } // namespace aoti

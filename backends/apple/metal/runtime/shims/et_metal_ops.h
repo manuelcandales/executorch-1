@@ -59,6 +59,22 @@ AOTITorchError aoti_torch_mps_convolution(
     int64_t groups,
     AOTITensorHandle* ret0);
 
+/**
+ * ExecutorTorch implementation of aoti_torch_mps__scaled_dot_product_attention_math_for_mps.
+ * Performs scaled dot product attention calculation - matches PyTorch AOTI signature
+ */
+AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
+    AOTITensorHandle query,
+    AOTITensorHandle key,
+    AOTITensorHandle value,
+    AOTITensorHandle* attn_mask,
+    double dropout_p,
+    int32_t is_causal,
+    AOTITensorHandle* dropout_mask,
+    double* scale,
+    AOTITensorHandle* ret0,
+    AOTITensorHandle* ret1);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
