@@ -819,38 +819,36 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           NSDictionary* results = @{outputTensor: outputData};
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created results dictionary");
 
-          // Execute the MPSGraph using a corrected direct approach
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Executing MPSGraph with corrected approach");
+          // Execute the MPSGraph using a completely independent Metal infrastructure
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Executing MPSGraph with independent Metal resources");
 
-          // Use dispatch_sync_with_rethrow to match PyTorch's approach for MPSGraph
-          dispatch_sync_with_rethrow(stream->queue(), ^() {
-            @autoreleasepool {
-              // Get a fresh command buffer for this specific operation
-              id<MTLCommandBuffer> cmdBuf = [stream->commandQueue() commandBuffer];
-              if (!cmdBuf) {
-                ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create fresh command buffer");
-                throw std::runtime_error("Failed to create fresh command buffer");
-              }
+          // Create completely independent Metal resources to avoid any conflicts
+          id<MTLDevice> device = get_metal_device();
+          id<MTLCommandQueue> independentQueue = [device newCommandQueue];
+          id<MTLCommandBuffer> independentCmdBuf = [independentQueue commandBuffer];
 
-              // Use the newer MPSGraph API with resultsDictionary
-              [mpsGraph encodeToCommandBuffer:cmdBuf
-                                        feeds:feeds
-                             targetOperations:nil
-                            resultsDictionary:results
-                          executionDescriptor:nil];
+          if (!independentCmdBuf) {
+            ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create independent command buffer");
+            throw std::runtime_error("Failed to create independent command buffer");
+          }
 
-              // Commit and wait for completion
-              [cmdBuf commit];
-              [cmdBuf waitUntilCompleted];
+          // Use the correct MPSGraph API with resultsDictionary
+          [mpsGraph encodeToCommandBuffer:independentCmdBuf
+                                    feeds:feeds
+                         targetOperations:nil
+                        resultsDictionary:results
+                      executionDescriptor:nil];
 
-              // Check for errors
-              if (cmdBuf.status == MTLCommandBufferStatusError) {
-                NSString* errorDesc = cmdBuf.error ? cmdBuf.error.description : @"Unknown error";
-                ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Command buffer execution failed: %s", [errorDesc UTF8String]);
-                throw std::runtime_error("Command buffer execution failed");
-              }
-            }
-          });
+          // Commit and wait for completion
+          [independentCmdBuf commit];
+          [independentCmdBuf waitUntilCompleted];
+
+          // Check for errors
+          if (independentCmdBuf.status == MTLCommandBufferStatusError) {
+            NSString* errorDesc = independentCmdBuf.error ? independentCmdBuf.error.description : @"Unknown error";
+            ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Command buffer execution failed: %s", [errorDesc UTF8String]);
+            throw std::runtime_error("Command buffer execution failed");
+          }
 
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph execution completed successfully");
 
