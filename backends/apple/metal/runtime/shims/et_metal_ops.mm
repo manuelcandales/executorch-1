@@ -644,175 +644,223 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           throw std::runtime_error("Failed to get command buffer from stream");
         }
 
-        // Method 1: Using MPSGraph scaledDotProductAttention API
+        // Method 1: Using MPSGraph scaledDotProductAttention API - with detailed error handling
         ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Implementing using MPSGraph scaledDotProductAttention");
 
-        // Create MPSGraph for scaled dot product attention
-        MPSGraph* mpsGraph = [MPSGraph new];
+        @try {
+          // Check if scaledDotProductAttentionWithQueryTensor is available
+          MPSGraph* testGraph = [MPSGraph new];
+          if (![testGraph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:maskTensor:scale:name:)]) {
+            ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: scaledDotProductAttentionWithQueryTensor API not available on this system");
+            throw std::runtime_error("scaledDotProductAttentionWithQueryTensor API not available on this system");
+          }
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: scaledDotProductAttentionWithQueryTensor API is available");
 
-        // Define tensor shapes for placeholders
-        NSArray<NSNumber*>* queryShape = @[@(batchSize), @(num_heads), @(qSize), @(headSize)];
-        NSArray<NSNumber*>* keyShape = @[@(batchSize), @(num_heads), @(kvSeqLength), @(headSize)];
-        NSArray<NSNumber*>* valueShape = @[@(batchSize), @(num_heads), @(kvSeqLength), @(headSize)];
+          // Create MPSGraph for scaled dot product attention
+          MPSGraph* mpsGraph = [MPSGraph new];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created MPSGraph instance");
 
-        // Create placeholders for input tensors
-        MPSGraphTensor* queryPlaceholder = [mpsGraph placeholderWithShape:queryShape
+          // Define tensor shapes for placeholders
+          NSArray<NSNumber*>* queryShape = @[@(batchSize), @(num_heads), @(qSize), @(headSize)];
+          NSArray<NSNumber*>* keyShape = @[@(batchSize), @(num_heads), @(kvSeqLength), @(headSize)];
+          NSArray<NSNumber*>* valueShape = @[@(batchSize), @(num_heads), @(kvSeqLength), @(headSize)];
+
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Creating placeholders with shapes Q:[%d,%d,%d,%d] K:[%d,%d,%d,%d] V:[%d,%d,%d,%d]",
+                 (int)batchSize, (int)num_heads, (int)qSize, (int)headSize,
+                 (int)batchSize, (int)num_heads, (int)kvSeqLength, (int)headSize,
+                 (int)batchSize, (int)num_heads, (int)kvSeqLength, (int)headSize);
+
+          // Create placeholders for input tensors
+          MPSGraphTensor* queryPlaceholder = [mpsGraph placeholderWithShape:queryShape
+                                                                   dataType:MPSDataTypeFloat32
+                                                                       name:@"query"];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created query placeholder");
+
+          MPSGraphTensor* keyPlaceholder = [mpsGraph placeholderWithShape:keyShape
                                                                  dataType:MPSDataTypeFloat32
-                                                                     name:@"query"];
+                                                                     name:@"key"];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created key placeholder");
 
-        MPSGraphTensor* keyPlaceholder = [mpsGraph placeholderWithShape:keyShape
-                                                               dataType:MPSDataTypeFloat32
-                                                                   name:@"key"];
+          MPSGraphTensor* valuePlaceholder = [mpsGraph placeholderWithShape:valueShape
+                                                                   dataType:MPSDataTypeFloat32
+                                                                       name:@"value"];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created value placeholder");
 
-        MPSGraphTensor* valuePlaceholder = [mpsGraph placeholderWithShape:valueShape
-                                                                 dataType:MPSDataTypeFloat32
-                                                                     name:@"value"];
+          MPSGraphTensor* maskTensor = nil;
 
-        MPSGraphTensor* maskTensor = nil;
+          // Handle causal mask
+          if (is_causal) {
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Creating causal mask");
 
-        // Handle causal mask
-        if (is_causal) {
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Creating causal mask");
+            // Create a causal mask: lower triangular matrix filled with 0s, upper triangle with -inf
+            // Shape should be [qSize, kvSeqLength]
+            NSArray<NSNumber*>* maskShape = @[@(qSize), @(kvSeqLength)];
 
-          // Create a causal mask: lower triangular matrix filled with 0s, upper triangle with -inf
-          // Shape should be [qSize, kvSeqLength]
-          NSArray<NSNumber*>* maskShape = @[@(qSize), @(kvSeqLength)];
-
-          // Create ones tensor
-          MPSGraphTensor* onesTensor = [mpsGraph constantWithScalar:1.0f
-                                                              shape:maskShape
-                                                           dataType:MPSDataTypeFloat32];
-
-          // Create lower triangular mask (including diagonal)
-          MPSGraphTensor* causalMask = [mpsGraph bandPartWithTensor:onesTensor
-                                                          numLower:-1
-                                                          numUpper:0
-                                                              name:@"causal_mask"];
-
-          // Convert mask to attention weights format: 0 for allowed positions, -inf for masked
-          MPSGraphTensor* zerosTensor = [mpsGraph constantWithScalar:0.0f
-                                                               shape:maskShape
-                                                            dataType:MPSDataTypeFloat32];
-
-          MPSGraphTensor* negInfTensor = [mpsGraph constantWithScalar:-1e9f
+            // Create ones tensor
+            MPSGraphTensor* onesTensor = [mpsGraph constantWithScalar:1.0f
                                                                 shape:maskShape
                                                              dataType:MPSDataTypeFloat32];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created ones tensor for causal mask");
 
-          // Select: where causal_mask == 1, use 0.0, else use -inf
-          maskTensor = [mpsGraph selectWithPredicateTensor:causalMask
-                                       truePredicateTensor:zerosTensor
-                                      falsePredicateTensor:negInfTensor
-                                                      name:@"causal_mask_final"];
-        }
+            // Create lower triangular mask (including diagonal)
+            MPSGraphTensor* causalMask = [mpsGraph bandPartWithTensor:onesTensor
+                                                            numLower:-1
+                                                            numUpper:0
+                                                                name:@"causal_mask"];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created causal mask using bandPartWithTensor");
 
-        // Handle explicit attention mask if provided
-        MPSGraphTensor* explicitMaskPlaceholder = nil;
-        if (attn_mask && *attn_mask) {
-          auto* mask_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(*attn_mask);
+            // Convert mask to attention weights format: 0 for allowed positions, -inf for masked
+            MPSGraphTensor* zerosTensor = [mpsGraph constantWithScalar:0.0f
+                                                                 shape:maskShape
+                                                              dataType:MPSDataTypeFloat32];
 
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Adding explicit attention mask");
+            MPSGraphTensor* negInfTensor = [mpsGraph constantWithScalar:-1e9f
+                                                                  shape:maskShape
+                                                               dataType:MPSDataTypeFloat32];
 
-          // Create mask placeholder
-          NSMutableArray<NSNumber*>* maskShapeArray = [NSMutableArray array];
-          for (int i = 0; i < mask_tensor->dim(); i++) {
-            [maskShapeArray addObject:@(mask_tensor->sizes()[i])];
+            // Select: where causal_mask == 1, use 0.0, else use -inf
+            maskTensor = [mpsGraph selectWithPredicateTensor:causalMask
+                                         truePredicateTensor:zerosTensor
+                                        falsePredicateTensor:negInfTensor
+                                                        name:@"causal_mask_final"];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created final causal mask using selectWithPredicateTensor");
           }
 
-          explicitMaskPlaceholder = [mpsGraph placeholderWithShape:maskShapeArray
-                                                          dataType:MPSDataTypeFloat32
-                                                              name:@"attention_mask"];
+          // Handle explicit attention mask if provided
+          MPSGraphTensor* explicitMaskPlaceholder = nil;
+          if (attn_mask && *attn_mask) {
+            auto* mask_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(*attn_mask);
 
-          if (maskTensor) {
-            // Combine causal and explicit masks
-            maskTensor = [mpsGraph additionWithPrimaryTensor:maskTensor
-                                             secondaryTensor:explicitMaskPlaceholder
-                                                        name:@"combined_mask"];
-          } else {
-            maskTensor = explicitMaskPlaceholder;
-          }
-        }
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Adding explicit attention mask");
 
-        // Perform scaled dot product attention using MPSGraph
-        MPSGraphTensor* outputTensor = [mpsGraph scaledDotProductAttentionWithQueryTensor:queryPlaceholder
-                                                                               keyTensor:keyPlaceholder
-                                                                             valueTensor:valuePlaceholder
-                                                                              maskTensor:maskTensor
-                                                                                   scale:scale_factor
-                                                                                    name:@"scaled_dot_product_attention"];
-
-        // Create feeds dictionary for graph execution
-        NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
-
-        // Create MPSGraphTensorData objects for input tensors
-        MPSGraphTensorData* queryData = [[MPSGraphTensorData alloc] initWithMTLBuffer:query_buffer
-                                                                                shape:queryShape
-                                                                             dataType:MPSDataTypeFloat32];
-        MPSGraphTensorData* keyData = [[MPSGraphTensorData alloc] initWithMTLBuffer:key_buffer
-                                                                              shape:keyShape
-                                                                           dataType:MPSDataTypeFloat32];
-        MPSGraphTensorData* valueData = [[MPSGraphTensorData alloc] initWithMTLBuffer:value_buffer
-                                                                                shape:valueShape
-                                                                             dataType:MPSDataTypeFloat32];
-
-        feeds[queryPlaceholder] = queryData;
-        feeds[keyPlaceholder] = keyData;
-        feeds[valuePlaceholder] = valueData;
-
-        // Add explicit mask data to feeds if provided
-        if (explicitMaskPlaceholder && attn_mask && *attn_mask) {
-          auto* mask_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(*attn_mask);
-          void* mask_data_ptr = mask_tensor->mutable_data_ptr();
-
-          // Get or create Metal buffer for mask
-          id<MTLBuffer> mask_buffer = nullptr;
-          auto mask_it = ptr_to_mtl_buffer.find(mask_data_ptr);
-          if (mask_it != ptr_to_mtl_buffer.end()) {
-            mask_buffer = mask_it->second;
-          } else {
-            size_t mask_size = mask_tensor->numel() * sizeof(float);
-            mask_buffer = [device newBufferWithBytes:mask_data_ptr
-                                              length:mask_size
-                                             options:MTLResourceStorageModeShared];
-            if (!mask_buffer) {
-              ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create Metal buffer for attention mask");
-              throw std::runtime_error("Failed to create Metal buffer for attention mask");
+            // Create mask placeholder
+            NSMutableArray<NSNumber*>* maskShapeArray = [NSMutableArray array];
+            for (int i = 0; i < mask_tensor->dim(); i++) {
+              [maskShapeArray addObject:@(mask_tensor->sizes()[i])];
             }
+
+            explicitMaskPlaceholder = [mpsGraph placeholderWithShape:maskShapeArray
+                                                            dataType:MPSDataTypeFloat32
+                                                                name:@"attention_mask"];
+
+            if (maskTensor) {
+              // Combine causal and explicit masks
+              maskTensor = [mpsGraph additionWithPrimaryTensor:maskTensor
+                                               secondaryTensor:explicitMaskPlaceholder
+                                                          name:@"combined_mask"];
+            } else {
+              maskTensor = explicitMaskPlaceholder;
+            }
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created explicit mask placeholder");
           }
 
-          NSMutableArray<NSNumber*>* maskShapeArray = [NSMutableArray array];
-          for (int i = 0; i < mask_tensor->dim(); i++) {
-            [maskShapeArray addObject:@(mask_tensor->sizes()[i])];
-          }
+          // Perform scaled dot product attention using MPSGraph
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Calling scaledDotProductAttentionWithQueryTensor with scale=%f", scale_factor);
 
-          MPSGraphTensorData* maskData = [[MPSGraphTensorData alloc] initWithMTLBuffer:mask_buffer
-                                                                                 shape:maskShapeArray
-                                                                              dataType:MPSDataTypeFloat32];
-          feeds[explicitMaskPlaceholder] = maskData;
-        }
+          MPSGraphTensor* outputTensor = [mpsGraph scaledDotProductAttentionWithQueryTensor:queryPlaceholder
+                                                                                 keyTensor:keyPlaceholder
+                                                                               valueTensor:valuePlaceholder
+                                                                                maskTensor:maskTensor
+                                                                                     scale:scale_factor
+                                                                                      name:@"scaled_dot_product_attention"];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Successfully created SDPA tensor");
 
-        // Create results dictionary
-        NSArray<NSNumber*>* outputShape = @[@(batchSize), @(num_heads), @(qSize), @(headSize)];
-        MPSGraphTensorData* outputData = [[MPSGraphTensorData alloc] initWithMTLBuffer:out_buffer
-                                                                                  shape:outputShape
+          // Create feeds dictionary for graph execution
+          NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created feeds dictionary");
+
+          // Create MPSGraphTensorData objects for input tensors
+          MPSGraphTensorData* queryData = [[MPSGraphTensorData alloc] initWithMTLBuffer:query_buffer
+                                                                                  shape:queryShape
                                                                                dataType:MPSDataTypeFloat32];
+          MPSGraphTensorData* keyData = [[MPSGraphTensorData alloc] initWithMTLBuffer:key_buffer
+                                                                                shape:keyShape
+                                                                             dataType:MPSDataTypeFloat32];
+          MPSGraphTensorData* valueData = [[MPSGraphTensorData alloc] initWithMTLBuffer:value_buffer
+                                                                                  shape:valueShape
+                                                                               dataType:MPSDataTypeFloat32];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created MPSGraphTensorData objects for inputs");
 
-        NSDictionary* results = @{outputTensor: outputData};
+          feeds[queryPlaceholder] = queryData;
+          feeds[keyPlaceholder] = keyData;
+          feeds[valuePlaceholder] = valueData;
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Added input tensors to feeds");
 
-        // Execute the MPSGraph
-        [mpsGraph encodeToCommandBuffer:commandBuffer
-                                  feeds:feeds
-                       targetTensors:results.allKeys
-                       targetOperations:nil
-                    executionDescriptor:nil];
+          // Add explicit mask data to feeds if provided
+          if (explicitMaskPlaceholder && attn_mask && *attn_mask) {
+            auto* mask_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(*attn_mask);
+            void* mask_data_ptr = mask_tensor->mutable_data_ptr();
 
-        // Commit the command buffer and wait for completion
-        [commandBuffer commit];
-        [commandBuffer waitUntilCompleted];
+            // Get or create Metal buffer for mask
+            id<MTLBuffer> mask_buffer = nullptr;
+            auto mask_it = ptr_to_mtl_buffer.find(mask_data_ptr);
+            if (mask_it != ptr_to_mtl_buffer.end()) {
+              mask_buffer = mask_it->second;
+            } else {
+              size_t mask_size = mask_tensor->numel() * sizeof(float);
+              mask_buffer = [device newBufferWithBytes:mask_data_ptr
+                                                length:mask_size
+                                               options:MTLResourceStorageModeShared];
+              if (!mask_buffer) {
+                ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create Metal buffer for attention mask");
+                throw std::runtime_error("Failed to create Metal buffer for attention mask");
+              }
+            }
 
-        // Copy results back to CPU memory
-        memcpy(out_data, [out_buffer contents], out_size_bytes);
+            NSMutableArray<NSNumber*>* maskShapeArray = [NSMutableArray array];
+            for (int i = 0; i < mask_tensor->dim(); i++) {
+              [maskShapeArray addObject:@(mask_tensor->sizes()[i])];
+            }
 
-        ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph execution completed successfully");
+            MPSGraphTensorData* maskData = [[MPSGraphTensorData alloc] initWithMTLBuffer:mask_buffer
+                                                                                   shape:maskShapeArray
+                                                                                dataType:MPSDataTypeFloat32];
+            feeds[explicitMaskPlaceholder] = maskData;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Added explicit mask tensor to feeds");
+          }
+
+          // Create results dictionary
+          NSArray<NSNumber*>* outputShape = @[@(batchSize), @(num_heads), @(qSize), @(headSize)];
+          MPSGraphTensorData* outputData = [[MPSGraphTensorData alloc] initWithMTLBuffer:out_buffer
+                                                                                    shape:outputShape
+                                                                                 dataType:MPSDataTypeFloat32];
+
+          NSDictionary* results = @{outputTensor: outputData};
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created results dictionary");
+
+          // Execute the MPSGraph
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Encoding MPSGraph to command buffer");
+          [mpsGraph encodeToCommandBuffer:commandBuffer
+                                    feeds:feeds
+                         targetTensors:results.allKeys
+                         targetOperations:nil
+                      executionDescriptor:nil];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Successfully encoded MPSGraph");
+
+          // Commit the command buffer and wait for completion
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Committing command buffer");
+          [commandBuffer commit];
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Waiting for command buffer completion");
+          [commandBuffer waitUntilCompleted];
+
+          // Check command buffer status
+          if (commandBuffer.status == MTLCommandBufferStatusError) {
+            NSString* errorDesc = commandBuffer.error ? commandBuffer.error.description : @"Unknown error";
+            ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Command buffer execution failed: %s", [errorDesc UTF8String]);
+            throw std::runtime_error("Command buffer execution failed");
+          }
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Command buffer completed successfully");
+
+          // Copy results back to CPU memory
+          memcpy(out_data, [out_buffer contents], out_size_bytes);
+
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph execution completed successfully");
+
+        } @catch (NSException *exception) {
+          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: NSException caught: %s - %s",
+                 [[exception name] UTF8String], [[exception reason] UTF8String]);
+          throw std::runtime_error("MPSGraph operation failed with NSException");
+        }
 
         // For attention weights, we'll create a dummy tensor filled with zeros for now
         // In a full implementation, you'd need to extract attention weights from the graph
