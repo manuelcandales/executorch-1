@@ -819,10 +819,40 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           NSDictionary* results = @{outputTensor: outputData};
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created results dictionary");
 
-          // Execute the MPSGraph using the stream's executeMPSGraph method
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Executing MPSGraph via stream");
-          stream->executeMPSGraph(mpsGraph, feeds, results, SyncType::COMMIT_AND_WAIT);
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph execution completed via stream");
+          // Execute the MPSGraph using a corrected direct approach
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Executing MPSGraph with corrected approach");
+
+          // Use dispatch_sync_with_rethrow to match PyTorch's approach for MPSGraph
+          dispatch_sync_with_rethrow(stream->queue(), ^() {
+            @autoreleasepool {
+              // Get a fresh command buffer for this specific operation
+              id<MTLCommandBuffer> cmdBuf = [stream->commandQueue() commandBuffer];
+              if (!cmdBuf) {
+                ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create fresh command buffer");
+                throw std::runtime_error("Failed to create fresh command buffer");
+              }
+
+              // Use the newer MPSGraph API with resultsDictionary
+              [mpsGraph encodeToCommandBuffer:cmdBuf
+                                        feeds:feeds
+                             targetOperations:nil
+                            resultsDictionary:results
+                          executionDescriptor:nil];
+
+              // Commit and wait for completion
+              [cmdBuf commit];
+              [cmdBuf waitUntilCompleted];
+
+              // Check for errors
+              if (cmdBuf.status == MTLCommandBufferStatusError) {
+                NSString* errorDesc = cmdBuf.error ? cmdBuf.error.description : @"Unknown error";
+                ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Command buffer execution failed: %s", [errorDesc UTF8String]);
+                throw std::runtime_error("Command buffer execution failed");
+              }
+            }
+          });
+
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph execution completed successfully");
 
           // Copy results back to CPU memory
           memcpy(out_data, [out_buffer contents], out_size_bytes);
