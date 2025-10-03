@@ -489,15 +489,13 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
   }
 
   try {
-    // Use dispatch_sync_with_rethrow to match custom kernel synchronization behavior
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        // Convert AOTITensorHandle to ExecutorTorch tensors
-        auto* query_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(query);
-        auto* key_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(key);
-        auto* value_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(value);
+    @autoreleasepool {
+      // Convert AOTITensorHandle to ExecutorTorch tensors
+      auto* query_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(query);
+      auto* key_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(key);
+      auto* value_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(value);
 
-        ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Converted tensor handles to ET tensors");
+      ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Converted tensor handles to ET tensors");
 
         // Validate tensor dimensions
         if (query_tensor->dim() < 3 || key_tensor->dim() < 3 || value_tensor->dim() < 3) {
@@ -636,13 +634,6 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
 
         // End any existing kernel coalescing to ensure a clean state for MPS
         stream->endKernelCoalescing();
-
-        // Get command buffer from stream
-        id<MTLCommandBuffer> commandBuffer = stream->commandBuffer();
-        if (!commandBuffer) {
-          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to get command buffer from stream");
-          throw std::runtime_error("Failed to get command buffer from stream");
-        }
 
         // Method 1: Using MPSGraph scaledDotProductAttention API - with detailed error handling
         ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Implementing using MPSGraph scaledDotProductAttention");
@@ -828,28 +819,10 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           NSDictionary* results = @{outputTensor: outputData};
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created results dictionary");
 
-          // Execute the MPSGraph
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Encoding MPSGraph to command buffer");
-          [mpsGraph encodeToCommandBuffer:commandBuffer
-                                    feeds:feeds
-                         targetTensors:results.allKeys
-                         targetOperations:nil
-                      executionDescriptor:nil];
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Successfully encoded MPSGraph");
-
-          // Commit the command buffer and wait for completion
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Committing command buffer");
-          [commandBuffer commit];
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Waiting for command buffer completion");
-          [commandBuffer waitUntilCompleted];
-
-          // Check command buffer status
-          if (commandBuffer.status == MTLCommandBufferStatusError) {
-            NSString* errorDesc = commandBuffer.error ? commandBuffer.error.description : @"Unknown error";
-            ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Command buffer execution failed: %s", [errorDesc UTF8String]);
-            throw std::runtime_error("Command buffer execution failed");
-          }
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Command buffer completed successfully");
+          // Execute the MPSGraph using the stream's executeMPSGraph method
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Executing MPSGraph via stream");
+          stream->executeMPSGraph(mpsGraph, feeds, results, SyncType::COMMIT_AND_WAIT);
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph execution completed via stream");
 
           // Copy results back to CPU memory
           memcpy(out_data, [out_buffer contents], out_size_bytes);
@@ -918,9 +891,8 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         *ret0 = out_tensor_handle;
         *ret1 = attn_tensor_handle;
 
-        ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph implementation completed successfully");
-      }
-    });
+      ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph implementation completed successfully");
+    }
 
     return Error::Ok;
 
