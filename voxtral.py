@@ -8,6 +8,7 @@ from torch.export.pt2_archive._package import package_pt2, load_pt2
 from optimum.executorch import ExecuTorchModelForMultiModalToText
 from optimum.exporters.executorch.tasks.multimodal_text_to_text import load_multimodal_text_to_text_model
 
+from executorch.backends.apple.metal.metal_backend import MetalBackend
 from executorch.backends.apple.metal.metal_partitioner import MetalPartitioner
 from executorch.exir import to_edge_transform_and_lower
 
@@ -48,7 +49,7 @@ def executorch_metal_lowering(ep, name):
     # 2. to_edge: Make optimizations for Edge devices
     print("Step 3: Lowering to Edge dialect...")
     edge_program = to_edge_transform_and_lower(
-        aten_dialect, partitioner=[MetalPartitioner([])]
+        aten_dialect, partitioner=[MetalPartitioner([MetalBackend.generate_method_name_compile_spec(name)])]
     )
     print("Lowering to Edge dialect done.")
 

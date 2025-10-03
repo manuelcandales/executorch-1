@@ -18,17 +18,16 @@ namespace aoti {
 
 // Enum for supported data types in et-metal backend
 enum class SupportedDTypes : int32_t {
-  FLOAT32 = 6, // PyTorch's float32 dtype code
-
+  // UINT8 = 0,    // PyTorch's uint8 dtype code
+  // INT8 = 1,     // PyTorch's int8 dtype code
+  // INT16 = 2,    // PyTorch's int16 dtype code
+  // INT32 = 3,    // PyTorch's int32 dtype code
+  INT64 = 4,    // PyTorch's int64 dtype code
+  // FLOAT16 = 5,  // PyTorch's float16 dtype code
+  FLOAT32 = 6,     // PyTorch's float32 dtype code
+  // FLOAT64 = 7,  // PyTorch's float64 dtype code
   // BOOL = 11,    // PyTorch's bool dtype code
-  // UINT8 = 1,    // PyTorch's uint8 dtype code
-  // INT8 = 2,     // PyTorch's int8 dtype code
-  // INT16 = 3,    // PyTorch's int16 dtype code
-  // INT32 = 4,    // PyTorch's int32 dtype code
-  // INT64 = 5,    // PyTorch's int64 dtype code
-  // FLOAT16 = 7,  // PyTorch's float16 dtype code
-  // FLOAT64 = 8,  // PyTorch's float64 dtype code
-  // BFLOAT16 = 15 // PyTorch's bfloat16 dtype code
+  BFLOAT16 = 15    // PyTorch's bfloat16 dtype code
 };
 
 extern "C" {

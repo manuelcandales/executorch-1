@@ -24,6 +24,7 @@ from subprocess import check_call
 from typing import Any, Dict, Tuple
 
 import torch
+from executorch.backends.apple.metal.metal_backend import MetalBackend
 from executorch.backends.apple.metal.metal_partitioner import MetalPartitioner
 
 # from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
@@ -563,8 +564,9 @@ def export_model_to_et_aoti(
         # we should preserve the lowerable part and waiting for aoti backend handle that
         # Q: maybe need to turn on fallback_random?
 
+        method_name = "forward"
         edge_program = to_edge_transform_and_lower(
-            aten_dialect, partitioner=[MetalPartitioner([])]
+            aten_dialect, partitioner=[MetalPartitioner([MetalBackend.generate_method_name_compile_spec(method_name)])]
         )
 
     # edge_program = to_edge(aten_dialect)

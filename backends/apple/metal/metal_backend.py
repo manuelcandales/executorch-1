@@ -5,16 +5,18 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
-import copy
 import os
-import platform
 import typing
+from enum import Enum
 
-from subprocess import check_call
 from typing import Any, Dict, final, List, Optional, Set
 
 import torch
+from executorch.backends.apple.metal.replace_slice_copy_with_slice import (
+    ReplaceSliceCopyWithSlicePass,
+)
 from executorch.exir._serialize._named_data_store import NamedDataStore
+from executorch.exir._warnings import experimental
 from executorch.exir.backend.backend_details import (
     BackendDetails,
     ExportedProgram,
@@ -35,6 +37,10 @@ supported_fallback_kernels: Dict[str, Any] = {
 
 # required fallback kernels but not supported
 missing_fallback_kernels: Set[str] = set()
+
+
+class COMPILE_SPEC_KEYS(Enum):
+    METHOD_NAME = "method_name"
 
 
 # context manager for non-fallback guarantee
@@ -73,6 +79,9 @@ def collect_unsupported_fallback_kernels():
 
 
 @final
+@experimental(
+    "This API and all of Metal backend related functionality are experimental."
+)
 class MetalBackend(BackendDetails):
     @staticmethod
     def preprocess(
@@ -83,6 +92,9 @@ class MetalBackend(BackendDetails):
         # Move the edge_program from CPU to MPS for aoti compile
         mps_edge_program = move_to_device_pass(edge_program, "mps")
 
+        # replace slice_copy with slice
+        ReplaceSliceCopyWithSlicePass()(mps_edge_program.graph_module)
+
         edge_program_module = mps_edge_program.module()
 
         # Grab all input placeholders from the graph
@@ -92,20 +104,16 @@ class MetalBackend(BackendDetails):
             if node.op == "placeholder" and node.name in user_input_names:
                 user_input_placeholders.append(node.meta["val"])
 
-        output_path = os.path.join(os.getcwd(), "aoti.so")
-
         # Base options for all devices
         options: dict[str, typing.Any] = {
-            "aot_inductor.package_constants_in_so": True,
-            "aot_inductor.output_path": output_path,
-            "aot_inductor.force_mmap_weights": False,
-            "max_autotune": True,
-            # "aot_inductor.embed_kernel_binary": True,
+            # Do not link against the full PyTorch/libtorch library
             "aot_inductor.link_libtorch": False,
+            # Package model constants and other generated files directly in the shared object (.so) file
+            "aot_inductor.package_constants_in_so": True,
+            # Enable maximum automatic tuning for optimal performance
+            "max_autotune": True,
             # "aot_inductor.debug_compile": True,
-            # # Disable CPU threading/OpenMP to avoid libomp.dylib dependency
-            # "cpp.enable_kernel_profile": False,
-            # "cpp.threads": 1,  # Use single-threaded mode
+            # "aot_inductor.force_mmap_weights": False,
         }
 
         with collect_unsupported_fallback_kernels():
@@ -117,16 +125,15 @@ class MetalBackend(BackendDetails):
                     "Please add them to the AOTI backend."
                 )
 
-        assert so_path == output_path, f"Expected {output_path} but got {so_path}"
-
-        print("so_path", so_path)
-
+        # pyre-ignorep[6]: Incompatible parameter type
         with open(so_path, "rb") as f:
             so_data = f.read()
 
-        # Use device-specific blob name
         named_data_store = NamedDataStore()
-        named_data_store.add_named_data("so_blob", so_data, 1, f"aoti_metal_blob")
+        method_name = MetalBackend.method_name_from_compile_specs(compile_specs)
+        named_data_store.add_named_data(
+            method_name + "_so_blob", so_data, 1, "aoti_metal_blob"
+        )
 
         # Clean up the generated so file; it has been packaged into the NamdeDataStore
         # pyre-ignorep[6]: Incompatible parameter type
@@ -136,4 +143,31 @@ class MetalBackend(BackendDetails):
             processed_bytes=b"",
             debug_handle_map={},
             data_store_output=named_data_store.get_named_data_store_output(),
+        )
+
+    @staticmethod
+    def generate_method_name_compile_spec(
+        method_name: str,
+    ) -> CompileSpec:
+        """
+        Returns the compile spec representing the model compute precision, for additional details
+        please refer to the documentation for ``coremltools.precision``.
+        """
+        return CompileSpec(
+            COMPILE_SPEC_KEYS.METHOD_NAME.value,
+            method_name.encode("utf-8"),
+        )
+
+    @staticmethod
+    def method_name_from_compile_specs(
+        compile_specs: List[CompileSpec],
+    ) -> str:
+        """
+        Returns the method name from the compile specs.
+        """
+        for spec in compile_specs:
+            if spec.key == COMPILE_SPEC_KEYS.METHOD_NAME.value:
+                return spec.value.decode("utf-8")
+        raise RuntimeError(
+            f"Could not find method name in compile specs: {compile_specs}"
         )

@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -72,11 +73,23 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
   ) const override {
     ET_LOG(Info, "MetalBackend::init - Starting initialization");
 
+    std::string method_name;
+    for (const CompileSpec& spec : compile_specs) {
+      if (std::strcmp(spec.key, "method_name") == 0) {
+        method_name.assign(
+            static_cast<const char*>(spec.value.buffer),
+            spec.value.nbytes); // no nullptr guarantee, so pass size
+        break;
+      }
+    }
+
+    std::string so_blob_key =
+        method_name.empty() ? "so_blob" : method_name + "_so_blob";
+    ET_LOG(Info, "MetalBackend::init - so_blob_key: %s", so_blob_key.c_str());
+
     const NamedDataMap* named_data_map = context.get_named_data_map();
     ET_LOG(Info, "MetalBackend::init - Got named data map: %p", named_data_map);
 
-    std::string so_path = "/tmp/test.so";
-    std::string so_blob_key = "so_blob";
     ET_LOG(Info, "MetalBackend::init - Looking for blob key: %s", so_blob_key.c_str());
 
     Result<FreeableBuffer> aoti_metal_buffer =
@@ -84,7 +97,11 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
     ET_LOG(Info, "MetalBackend::init - Got buffer result");
 
     if (!aoti_metal_buffer.ok()) {
-      ET_LOG(Error, "MetalBackend::init - Failed to get buffer: %d", (int)aoti_metal_buffer.error());
+      ET_LOG(
+          Error,
+          "MetalBackend::init - Failed to get buffer for key %s: 0x%x",
+          so_blob_key.c_str(),
+          aoti_metal_buffer.error());
       return Error::InvalidArgument;
     }
 
@@ -96,6 +113,11 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
     }
 
     ET_LOG(Info, "MetalBackend::init - Buffer data pointer: %p", aoti_metal_buffer->data());
+
+    // Generate dynamic temporary file path
+    filesystem::path temp_dir = filesystem::temp_directory_path();
+    filesystem::path so_path =
+        temp_dir / (so_blob_key + to_string(getpid()) + ".so");
 
     // Create a temporary file
     ET_LOG(Info, "MetalBackend::init - Creating temp file: %s", so_path.c_str());

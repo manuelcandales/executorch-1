@@ -29,18 +29,17 @@ void cleanup_aoti_tensor_output() {
 // Helper function to check if a dtype is supported
 bool is_dtype_supported_in_et_metal(int32_t dtype) {
   switch (dtype) {
-    case static_cast<int32_t>(SupportedDTypes::FLOAT32):
-      return true;
     // case static_cast<int32_t>(SupportedDTypes::BOOL):
     // case static_cast<int32_t>(SupportedDTypes::UINT8):
     // case static_cast<int32_t>(SupportedDTypes::INT8):
     // case static_cast<int32_t>(SupportedDTypes::INT16):
     // case static_cast<int32_t>(SupportedDTypes::INT32):
-    // case static_cast<int32_t>(SupportedDTypes::INT64):
+    case static_cast<int32_t>(SupportedDTypes::INT64):
     // case static_cast<int32_t>(SupportedDTypes::FLOAT16):
+    case static_cast<int32_t>(SupportedDTypes::FLOAT32):
     // case static_cast<int32_t>(SupportedDTypes::FLOAT64):
-    // case static_cast<int32_t>(SupportedDTypes::BFLOAT16):
-    //   return true;
+    case static_cast<int32_t>(SupportedDTypes::BFLOAT16):
+      return true;
     default:
       return false;
   }
@@ -72,8 +71,13 @@ executorch::aten::ScalarType dtype_to_scalar_type(int32_t dtype) {
 
   // If supported, use switch to convert
   switch (dtype) {
-    case static_cast<int32_t>(SupportedDTypes::FLOAT32):
+    case 4: // PyTorch's int64 dtype code
+      return executorch::aten::ScalarType::Long;
+    case 6: // PyTorch's float32 dtype code
       return executorch::aten::ScalarType::Float;
+    case 15: // PyTorch's bfloat16 dtype code
+      return executorch::aten::ScalarType::BFloat16;
+    // Future support for additional dtypes can be added here
     default:
       ET_LOG(
           Error, "Unexpected error in dtype conversion for dtype: %d", dtype);
@@ -89,9 +93,11 @@ AOTITorchError validate_dtype(int32_t dtype) {
 
   ET_LOG(
       Error,
-      "Unsupported dtype: %d. Supported dtypes: %d (float32)",
+      "Unsupported dtype: %d. Supported dtypes: %d (int64), %d (float32), %d (bfloat16)",
       dtype,
-      static_cast<int32_t>(SupportedDTypes::FLOAT32));
+      static_cast<int32_t>(SupportedDTypes::INT64),
+      static_cast<int32_t>(SupportedDTypes::FLOAT32),
+      static_cast<int32_t>(SupportedDTypes::BFLOAT16));
   return Error::InvalidArgument;
 }
 
