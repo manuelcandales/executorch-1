@@ -410,6 +410,20 @@ AOTITorchError aoti_torch_mps_memcpy(
 
             memcpy(buffer_pointer + constant_offset, constants_start + bytes_read, data_size);
 
+            id<MTLDevice> device = get_metal_device();
+            if (!device) {
+                ET_LOG(Error, "aoti_torch_mps_memcpy: Failed to get Metal device");
+                return Error::Internal;
+            }
+            id<MTLBuffer> subBuffer = [device newBufferWithBytesNoCopy:buffer_pointer + constant_offset
+                                                                length:data_size
+                                                               options:MTLResourceCPUCacheModeWriteCombined | MTLResourceStorageModeShared
+                                                           deallocator:nil];
+
+            if (constant_offset != 0) {
+                ptr_to_mtl_buffer[buffer_pointer + constant_offset] = subBuffer;  // Map contents to buffer
+            }
+
             ET_LOG(Debug, "aoti_torch_mps_memcpy: Copied %zu bytes from offset %zu to buffer offset %zu",
                    data_size, bytes_read, constant_offset);
             return Error::Ok;
