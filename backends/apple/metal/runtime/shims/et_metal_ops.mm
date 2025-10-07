@@ -100,58 +100,30 @@ AOTITorchError aoti_torch_mps_mm_out(
         void* mat2_data_ptr = mat2_tensor->mutable_data_ptr();
         void* out_data_ptr = out_tensor->mutable_data_ptr();
 
-        id<MTLBuffer> self_buffer = nullptr;
-        id<MTLBuffer> mat2_buffer = nullptr;
-        id<MTLBuffer> out_buffer = nullptr;
-
         // Look up Metal buffers from the global mapping
         auto self_it = ptr_to_mtl_buffer.find(self_data_ptr);
         auto mat2_it = ptr_to_mtl_buffer.find(mat2_data_ptr);
         auto out_it = ptr_to_mtl_buffer.find(out_data_ptr);
 
-        if (self_it != ptr_to_mtl_buffer.end()) {
-          self_buffer = self_it->second;
+        if (self_it == ptr_to_mtl_buffer.end()) {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: self tensor not found in Metal buffer mapping");
+          throw std::runtime_error("self tensor not found in Metal buffer mapping");
         }
-        if (mat2_it != ptr_to_mtl_buffer.end()) {
-          mat2_buffer = mat2_it->second;
+        if (mat2_it == ptr_to_mtl_buffer.end()) {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: mat2 tensor not found in Metal buffer mapping");
+          throw std::runtime_error("mat2 tensor not found in Metal buffer mapping");
         }
-        if (out_it != ptr_to_mtl_buffer.end()) {
-          out_buffer = out_it->second;
-        }
-
-        // If buffers are not in Metal memory, create temporary Metal buffers
-        if (!self_buffer) {
-          size_t self_size = self_tensor->numel() * sizeof(float);
-          self_buffer = [device newBufferWithBytes:self_data_ptr
-                                            length:self_size
-                                           options:MTLResourceStorageModeShared];
-          if (!self_buffer) {
-            ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for self tensor");
-            throw std::runtime_error("Failed to create Metal buffer for self tensor");
-          }
+        if (out_it == ptr_to_mtl_buffer.end()) {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: out tensor not found in Metal buffer mapping");
+          throw std::runtime_error("out tensor not found in Metal buffer mapping");
         }
 
-        if (!mat2_buffer) {
-          size_t mat2_size = mat2_tensor->numel() * sizeof(float);
-          mat2_buffer = [device newBufferWithBytes:mat2_data_ptr
-                                            length:mat2_size
-                                           options:MTLResourceStorageModeShared];
-          if (!mat2_buffer) {
-            ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for mat2 tensor");
-            throw std::runtime_error("Failed to create Metal buffer for mat2 tensor");
-          }
-        }
+        id<MTLBuffer> self_buffer = self_it->second;
+        id<MTLBuffer> mat2_buffer = mat2_it->second;
+        id<MTLBuffer> out_buffer = out_it->second;
 
-        if (!out_buffer) {
-          size_t out_size = out_tensor->numel() * sizeof(float);
-          out_buffer = [device newBufferWithBytes:out_data_ptr
-                                           length:out_size
-                                          options:MTLResourceStorageModeShared];
-          if (!out_buffer) {
-            ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to create Metal buffer for out tensor");
-            throw std::runtime_error("Failed to create Metal buffer for out tensor");
-          }
-        }
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: Using existing Metal buffers - self=%p, mat2=%p, out=%p",
+               self_buffer, mat2_buffer, out_buffer);
 
         // End any existing kernel coalescing to ensure a clean state for MPS
         stream->endKernelCoalescing();
@@ -219,7 +191,7 @@ AOTITorchError aoti_torch_mps_mm_out(
         [outMatrix release];
         [matmul release];
 
-        ET_LOG(Debug, "aoti_torch_mps_mm_out: Matrix multiplication completed successfully with synchronization");
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: Matrix multiplication completed successfully");
       }
     });
 
