@@ -15,6 +15,7 @@
 
 // Forward declarations for MetalPerformanceShadersGraph types
 @class MPSGraph;
+@class MPSCommandBuffer;
 
 #else
 // Forward declarations for C++ compilation
@@ -148,7 +149,7 @@ public:
     dispatch_queue_t queue() const { return serialQueue_; }
 
     // Command buffer management with lazy creation
-    id<MTLCommandBuffer> commandBuffer();
+    MPSCommandBuffer* commandBuffer();
     id<MTLComputeCommandEncoder> commandEncoder();
 
     // Synchronization methods
@@ -173,8 +174,8 @@ private:
     // Private members
     id<MTLDevice> device_;
     id<MTLCommandQueue> commandQueue_;
-    id<MTLCommandBuffer> commandBuffer_;
-    id<MTLCommandBuffer> prevCommandBuffer_;  // For commit-and-continue pattern
+    MPSCommandBuffer* commandBuffer_;
+    MPSCommandBuffer* prevCommandBuffer_;  // For commit-and-continue pattern
     id<MTLComputeCommandEncoder> commandEncoder_;
     dispatch_queue_t serialQueue_;  // For thread safety
 

@@ -294,6 +294,25 @@ class MockConv1d(nn.Module):
         return self.conv(x)
 
 
+class VoxtralConv1d(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels=128,
+            out_channels=1280,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            dilation=1,
+            groups=1,
+            bias=False,
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, embed_dim=256, num_heads=8, ff_dim=1024, dropout=0.1):
         super().__init__()
@@ -468,6 +487,11 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "model_class": MockConv1d,
         "input_shapes": [(1, 80, 3000)],
         "description": "Conv1d layer with 80 input channels, 384 output channels",
+    },
+    "voxtral_conv1d": {
+        "model_class": VoxtralConv1d,
+        "input_shapes": [(10, 128, 3000)],
+        "description": "Conv1d layer with 128 input channels, 3000 output channels",
     },
     "transformer_block": {
         "model_class": TransformerBlock,

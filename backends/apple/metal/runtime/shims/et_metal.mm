@@ -556,15 +556,15 @@ ETMetalStream* ETMetalStream::getDefaultStream() {
     return defaultStream_;
 }
 
-// Lazy command buffer creation
-id<MTLCommandBuffer> ETMetalStream::commandBuffer() {
+// Lazy command buffer creation (use MPSCommandBuffer like PyTorch)
+MPSCommandBuffer* ETMetalStream::commandBuffer() {
     if (!commandBuffer_) {
         if (!commandQueue_) {
             ET_LOG(Error, "ETMetalStream::commandBuffer: No command queue available");
             return nil;
         }
 
-        commandBuffer_ = [commandQueue_ commandBuffer];
+        commandBuffer_ = [MPSCommandBuffer commandBufferFromCommandQueue:commandQueue_];
         if (!commandBuffer_) {
             ET_LOG(Error, "ETMetalStream::commandBuffer: Failed to create command buffer");
             return nil;
@@ -580,7 +580,7 @@ id<MTLCommandBuffer> ETMetalStream::commandBuffer() {
 // Lazy command encoder creation
 id<MTLComputeCommandEncoder> ETMetalStream::commandEncoder() {
     if (!commandEncoder_) {
-        id<MTLCommandBuffer> cmdBuffer = commandBuffer();
+        MPSCommandBuffer* cmdBuffer = commandBuffer();
         if (!cmdBuffer) {
             ET_LOG(Error, "ETMetalStream::commandEncoder: Failed to get command buffer");
             return nil;
@@ -771,7 +771,7 @@ void ETMetalStream::executeMPSGraph(MPSGraph* mpsGraph, NSDictionary* feeds, NSD
                           resultsDictionary:results
                         executionDescriptor:nil];
 
-            synchronize(syncType);
+            //synchronize(syncType);
         }
     });
 }

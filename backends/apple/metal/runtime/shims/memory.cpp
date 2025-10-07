@@ -397,7 +397,7 @@ AOTITorchError aoti_torch_copy_(
     return src_dtype_error;
   }
 
-  // Get stride information for layout validation
+  // Get stride information for layout/contiguity validation
   int64_t* self_strides;
   int64_t* src_strides;
   aoti_torch_get_strides(self, &self_strides);
@@ -407,6 +407,67 @@ AOTITorchError aoti_torch_copy_(
   int64_t* src_sizes;
   aoti_torch_get_sizes(self, &self_sizes);
   aoti_torch_get_sizes(src, &src_sizes);
+
+  // Fast-path: if dims differ but total bytes equal and both are contiguous,
+  // allow a raw copy (treat as a reshape-compatible copy).
+  if (self->dim() != src->dim()) {
+    size_t self_bytes = self->nbytes();
+    size_t src_bytes = src->nbytes();
+
+    bool self_contig = is_tensor_contiguous(self->dim(), self_sizes, self_strides);
+    bool src_contig = is_tensor_contiguous(src->dim(), src_sizes, src_strides);
+
+    if (self_bytes == src_bytes && self_contig && src_contig) {
+      // Determine device locations
+      bool srcIsDevice = metal_is_device_pointer(const_cast<void*>(src->data_ptr()));
+      bool dstIsDevice = metal_is_device_pointer(self->mutable_data_ptr());
+
+      if (srcIsDevice && dstIsDevice) {
+        int result = metal_copy_memory(
+            self->mutable_data_ptr(),
+            src->data_ptr(),
+            self_bytes,
+            true,
+            true);
+        if (result != 0) {
+          ET_LOG(Error, "Failed to copy (reshape-compatible) from Metal device to device");
+          return Error::Internal;
+        }
+      } else if (srcIsDevice && !dstIsDevice) {
+        int result = metal_copy_memory(
+            self->mutable_data_ptr(),
+            src->data_ptr(),
+            self_bytes,
+            true,
+            false);
+        if (result != 0) {
+          ET_LOG(Error, "Failed to copy (reshape-compatible) from Metal device to host");
+          return Error::Internal;
+        }
+      } else if (!srcIsDevice && dstIsDevice) {
+        int result = metal_copy_memory(
+            self->mutable_data_ptr(),
+            src->data_ptr(),
+            self_bytes,
+            false,
+            true);
+        if (result != 0) {
+          ET_LOG(Error, "Failed to copy (reshape-compatible) from host to Metal device");
+          return Error::Internal;
+        }
+      } else {
+        std::memcpy(self->mutable_data_ptr(), src->data_ptr(), self_bytes);
+      }
+      return Error::Ok;
+    }
+
+    ET_LOG(
+        Error,
+        "dimension mismatch. self.dim()=%zd, src.dim()=%zd",
+        self->dim(),
+        src->dim());
+    return Error::InvalidArgument;
+  }
 
   // Check if tensors have the same tensor schema (sizes, strides, dtype)
   bool same_schema = true;

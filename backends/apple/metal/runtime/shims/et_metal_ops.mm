@@ -14,6 +14,7 @@
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include "et_metal_ops.h"
 #include "et_metal.h"
+#include "shim_mps.h"
 #include "utils.h"
 #include "memory.h"
 #include <functional>
@@ -327,33 +328,96 @@ AOTITorchError aoti_torch_mps_convolution(
         ET_LOG(Debug, "aoti_torch_mps_convolution: output_padding: [%lld, %lld]", output_padding[0], output_padding[1]);
       }
 
-      // Calculate output dimensions
-      // For now, we'll create a zero-filled tensor with the expected output shape
-      // TODO: Implement actual 2D convolution using MetalPerformanceShaders or custom Metal kernels
+      // Support conv1d and conv2d by inspecting weight rank.
+      // conv1d: weight dims = [C_out, C_in, K]
+      // conv2d: weight dims = [C_out, C_in, Kh, Kw]
+      bool is_conv1d = (weight_tensor->dim() == 3);
 
-      // Get input dimensions (assuming NCHW format)
-      int64_t N = input_tensor->sizes()[0];  // batch size
-      int64_t C_in = input_tensor->sizes()[1];  // input channels
-      int64_t H_in = input_tensor->sizes()[2];  // input height
-      int64_t W_in = input_tensor->sizes()[3];  // input width
+      // Accept input ranks:
+      // conv1d: 2D (C,W) or 3D (N,C,W)
+      // conv2d: 3D (C,H,W) or 4D (N,C,H,W)
+      bool has_batch_dim = false;
+      bool is_input_4d = false;
+      int64_t N = 1, C_in = 0, H_in = 1, W_in = 0;
+      if (is_conv1d) {
+        if (input_tensor->dim() == 2) {
+          // (C, W)
+          has_batch_dim = false;
+          C_in = input_tensor->sizes()[0];
+          W_in = input_tensor->sizes()[1];
+          H_in = 1;
+        } else if (input_tensor->dim() == 3) {
+          // (N, C, W)
+          has_batch_dim = true;
+          N = input_tensor->sizes()[0];
+          C_in = input_tensor->sizes()[1];
+          W_in = input_tensor->sizes()[2];
+          H_in = 1;
+        } else {
+          ET_LOG(Error, "aoti_torch_mps_convolution: conv1d expects 2D or 3D input, got %d", (int)input_tensor->dim());
+          return Error::InvalidArgument;
+        }
+      } else {
+        is_input_4d = (input_tensor->dim() == 4);
+        if (is_input_4d) {
+          // (N, C, H, W)
+          has_batch_dim = true;
+          N = input_tensor->sizes()[0];
+          C_in = input_tensor->sizes()[1];
+          H_in = input_tensor->sizes()[2];
+          W_in = input_tensor->sizes()[3];
+        } else if (input_tensor->dim() == 3) {
+          // (C, H, W)
+          has_batch_dim = false;
+          N = 1;
+          C_in = input_tensor->sizes()[0];
+          H_in = input_tensor->sizes()[1];
+          W_in = input_tensor->sizes()[2];
+        } else {
+          ET_LOG(Error, "aoti_torch_mps_convolution: conv2d expects 3D or 4D input, got %d", (int)input_tensor->dim());
+          return Error::InvalidArgument;
+        }
+      }
 
-      // Get weight dimensions (assuming OIHW format for weight)
+      // Get weight dimensions
       int64_t C_out = weight_tensor->sizes()[0];  // output channels
-      int64_t kernel_h = weight_tensor->sizes()[2];  // kernel height
-      int64_t kernel_w = weight_tensor->sizes()[3];  // kernel width
+      int64_t kernel_h = is_conv1d ? 1 : weight_tensor->sizes()[2];  // kernel height
+      int64_t kernel_w = is_conv1d ? weight_tensor->sizes()[2] : weight_tensor->sizes()[3];  // kernel width
 
-      // Calculate output dimensions
-      int64_t stride_h = stride && stride_len_ > 0 ? stride[0] : 1;
-      int64_t stride_w = stride && stride_len_ > 1 ? stride[1] : 1;
-      int64_t pad_h = padding && padding_len_ > 0 ? padding[0] : 0;
-      int64_t pad_w = padding && padding_len_ > 1 ? padding[1] : 0;
-      int64_t dil_h = dilation && dilation_len_ > 0 ? dilation[0] : 1;
-      int64_t dil_w = dilation && dilation_len_ > 1 ? dilation[1] : 1;
+      // Calculate output spatial dimensions
+      int64_t stride_h = is_conv1d ? 1 : (stride && stride_len_ > 0 ? stride[0] : 1);
+      int64_t stride_w = is_conv1d ? (stride && stride_len_ > 0 ? stride[0] : 1)
+                                   : (stride && stride_len_ > 1 ? stride[1] : 1);
+      int64_t pad_h = is_conv1d ? 0 : (padding && padding_len_ > 0 ? padding[0] : 0);
+      int64_t pad_w = is_conv1d ? (padding && padding_len_ > 0 ? padding[0] : 0)
+                                : (padding && padding_len_ > 1 ? padding[1] : 0);
+      int64_t dil_h = is_conv1d ? 1 : (dilation && dilation_len_ > 0 ? dilation[0] : 1);
+      int64_t dil_w = is_conv1d ? (dilation && dilation_len_ > 0 ? dilation[0] : 1)
+                                : (dilation && dilation_len_ > 1 ? dilation[1] : 1);
 
-      int64_t H_out = (H_in + 2 * pad_h - dil_h * (kernel_h - 1) - 1) / stride_h + 1;
-      int64_t W_out = (W_in + 2 * pad_w - dil_w * (kernel_w - 1) - 1) / stride_w + 1;
+      int64_t H_out, W_out;
+      if (transposed) {
+        // For transposed convolution, output size calculation is different
+        int64_t output_pad_h = is_conv1d ? 0 : (output_padding && output_padding_len_ > 0 ? output_padding[0] : 0);
+        int64_t output_pad_w = is_conv1d ? (output_padding && output_padding_len_ > 0 ? output_padding[0] : 0)
+                                         : (output_padding && output_padding_len_ > 1 ? output_padding[1] : 0);
+        H_out = is_conv1d ? 1 : ((H_in - 1) * stride_h - 2 * pad_h + dil_h * (kernel_h - 1) + output_pad_h + 1);
+        W_out = (W_in - 1) * stride_w - 2 * pad_w + dil_w * (kernel_w - 1) + output_pad_w + 1;
+      } else {
+        // Regular convolution output size calculation
+        H_out = is_conv1d ? 1 : ((H_in + 2 * pad_h - dil_h * (kernel_h - 1) - 1) / stride_h + 1);
+        W_out = (W_in + 2 * pad_w - dil_w * (kernel_w - 1) - 1) / stride_w + 1;
+      }
 
-      ET_LOG(Debug, "aoti_torch_mps_convolution: Calculated output shape: [%lld, %lld, %lld, %lld]", N, C_out, H_out, W_out);
+      if (!is_conv1d && is_input_4d) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: Calculated 4D output shape: [%lld, %lld, %lld, %lld]", N, C_out, H_out, W_out);
+      } else if (!is_conv1d) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: Calculated 3D output shape: [%lld, %lld, %lld]", C_out, H_out, W_out);
+      } else if (is_conv1d && has_batch_dim) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: Calculated 3D (1D conv) output shape: [%lld, %lld, %lld]", N, C_out, W_out);
+      } else {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: Calculated 2D (1D conv) output shape: [%lld, %lld]", C_out, W_out);
+      }
 
       // Validate output dimensions are positive
       if (N <= 0 || C_out <= 0 || H_out <= 0 || W_out <= 0) {
@@ -362,50 +426,285 @@ AOTITorchError aoti_torch_mps_convolution(
         return Error::InvalidArgument;
       }
 
-      // Create output tensor with calculated dimensions
-      std::vector<int32_t> output_sizes = {(int32_t)N, (int32_t)C_out, (int32_t)H_out, (int32_t)W_out};
-
-      // Calculate expected number of elements
-      size_t expected_numel = N * C_out * H_out * W_out;
-      ET_LOG(Debug, "aoti_torch_mps_convolution: Expected output tensor numel = %zu", expected_numel);
-
-      // Log the sizes vector for debugging
-      ET_LOG(Debug, "aoti_torch_mps_convolution: output_sizes vector: [%d, %d, %d, %d]",
-             output_sizes[0], output_sizes[1], output_sizes[2], output_sizes[3]);
-
-      // Allocate memory for the tensor data
-      size_t tensor_size_bytes = expected_numel * sizeof(float);
-      void* tensor_data = std::malloc(tensor_size_bytes);
-      if (!tensor_data) {
-        ET_LOG(Error, "aoti_torch_mps_convolution: Failed to allocate %zu bytes for tensor", tensor_size_bytes);
+      // Use the same dispatch pattern as other MPS operations for consistent synchronization
+      ETMetalStream* stream = getCurrentMetalStream();
+      if (!stream) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Failed to get current Metal stream");
         return Error::Internal;
       }
 
-      // Zero out the allocated memory
-      std::memset(tensor_data, 0, tensor_size_bytes);
+      // Get Metal device
+      id<MTLDevice> device = get_metal_device();
+      if (!device) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Failed to get Metal device");
+        throw std::runtime_error("Failed to get Metal device");
+      }
 
-      // Create tensor using aoti_torch_create_tensor_from_blob_v2 to ensure we have control over the memory
-      // Convert sizes vector to int64_t array
-      std::vector<int64_t> output_sizes_int64 = {N, C_out, H_out, W_out};
+      // Get Metal buffers from tensors using the global mapping
+      void* input_data_ptr = input_tensor->mutable_data_ptr();
+      void* weight_data_ptr = weight_tensor->mutable_data_ptr();
 
-      // Calculate default strides for a contiguous tensor (NCHW format)
-      std::vector<int64_t> output_strides = {
-          C_out * H_out * W_out,  // Stride for N dimension
-          H_out * W_out,          // Stride for C dimension
-          W_out,                  // Stride for H dimension
-          1                       // Stride for W dimension
-      };
+      // Look up Metal buffers from the global mapping
+      auto input_it = ptr_to_mtl_buffer.find(input_data_ptr);
+      auto weight_it = ptr_to_mtl_buffer.find(weight_data_ptr);
+
+      if (input_it == ptr_to_mtl_buffer.end()) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: input tensor not found in Metal buffer mapping");
+        throw std::runtime_error("input tensor not found in Metal buffer mapping");
+      }
+      if (weight_it == ptr_to_mtl_buffer.end()) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: weight tensor not found in Metal buffer mapping");
+        throw std::runtime_error("weight tensor not found in Metal buffer mapping");
+      }
+
+      id<MTLBuffer> input_buffer = input_it->second;
+      id<MTLBuffer> weight_buffer = weight_it->second;
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Using existing Metal buffers - input=%p, weight=%p",
+              input_buffer, weight_buffer);
+
+      // End any existing kernel coalescing to ensure a clean state for MPS
+      stream->endKernelCoalescing();
+
+      // Ensure stream is ready; command buffer handled internally by stream helpers
+
+      // Create MPSGraph for convolution
+      MPSGraph* mpsGraph = [MPSGraph new];
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created MPSGraph instance");
+
+      // Define tensor shapes for placeholders (always 4D NCHW for MPSGraph)
+      NSArray<NSNumber*>* inputShape = @[@(N), @(C_in), @(H_in), @(W_in)];
+      NSArray<NSNumber*>* weightShape = @[@(C_out), @(C_in), @(kernel_h), @(kernel_w)];
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Creating placeholders with shapes input:[%d,%d,%d,%d] weight:[%d,%d,%d,%d]",
+              (int)N, (int)C_in, (int)H_in, (int)W_in,
+              (int)C_out, (int)C_in, (int)kernel_h, (int)kernel_w);
+
+      // Create placeholders for input tensors
+      MPSGraphTensor* inputPlaceholder = [mpsGraph placeholderWithShape:inputShape
+                                                                dataType:MPSDataTypeFloat32
+                                                                    name:@"input"];
+      MPSGraphTensor* weightPlaceholder = [mpsGraph placeholderWithShape:weightShape
+                                                                  dataType:MPSDataTypeFloat32
+                                                                      name:@"weight"];
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created input and weight placeholders");
+
+      // Create convolution descriptor
+      MPSGraphConvolution2DOpDescriptor* convDesc = [MPSGraphConvolution2DOpDescriptor descriptorWithStrideInX:stride_w
+                                                                                                      strideInY:stride_h
+                                                                                                    dilationRateInX:dil_w
+                                                                                                    dilationRateInY:dil_h
+                                                                                                        groups:groups
+                                                                                                        paddingLeft:pad_w
+                                                                                                      paddingRight:pad_w
+                                                                                                        paddingTop:pad_h
+                                                                                                      paddingBottom:pad_h
+                                                                                                        paddingStyle:MPSGraphPaddingStyleExplicit
+                                                                                                        dataLayout:MPSGraphTensorNamedDataLayoutNCHW
+                                                                                                    weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created convolution descriptor with stride=[%lld,%lld], padding=[%lld,%lld], dilation=[%lld,%lld], groups=%lld",
+              stride_w, stride_h, pad_w, pad_h, dil_w, dil_h, groups);
+
+      // Perform convolution using MPSGraph
+      MPSGraphTensor* convOutput = nil;
+      if (transposed) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: Using transposed convolution");
+        // For transposed convolution, we need to handle output padding
+        int64_t output_pad_h = output_padding && output_padding_len_ > 0 ? output_padding[0] : 0;
+        int64_t output_pad_w = output_padding && output_padding_len_ > 1 ? output_padding[1] : 0;
+        
+        // For transposed convolution, we need to adjust the padding calculation
+        // In transposed convolution, the effective padding is typically negative
+        // and we use output_padding to control the final output size
+        int64_t transposed_pad_h = pad_h - output_pad_h;
+        int64_t transposed_pad_w = pad_w - output_pad_w;
+        
+        // Create transposed convolution descriptor with adjusted padding
+        MPSGraphConvolution2DOpDescriptor* transposedConvDesc = [MPSGraphConvolution2DOpDescriptor descriptorWithStrideInX:stride_w
+                                                                                                                  strideInY:stride_h
+                                                                                                            dilationRateInX:dil_w
+                                                                                                            dilationRateInY:dil_h
+                                                                                                                    groups:groups
+                                                                                                              paddingLeft:transposed_pad_w
+                                                                                                              paddingRight:transposed_pad_w
+                                                                                                                paddingTop:transposed_pad_h
+                                                                                                            paddingBottom:transposed_pad_h
+                                                                                                              paddingStyle:MPSGraphPaddingStyleExplicit
+                                                                                                              dataLayout:MPSGraphTensorNamedDataLayoutNCHW
+                                                                                                          weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+        
+        convOutput = [mpsGraph convolution2DWithSourceTensor:inputPlaceholder
+                                                  weightsTensor:weightPlaceholder
+                                                      descriptor:transposedConvDesc
+                                                            name:@"transposed_convolution"];
+      } else {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: Using regular convolution");
+        convOutput = [mpsGraph convolution2DWithSourceTensor:inputPlaceholder
+                                                  weightsTensor:weightPlaceholder
+                                                      descriptor:convDesc
+                                                            name:@"convolution"];
+      }
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Successfully created convolution tensor");
+
+      // Handle bias if provided
+      MPSGraphTensor* finalOutput = convOutput;
+      MPSGraphTensor* biasPlaceholder = nil;
+      if (bias_tensor) {
+        ET_LOG(Debug, "aoti_torch_mps_convolution: Adding bias to convolution output");
+        
+        // Get bias tensor data
+        void* bias_data_ptr = bias_tensor->mutable_data_ptr();
+        auto bias_it = ptr_to_mtl_buffer.find(bias_data_ptr);
+        
+        if (bias_it != ptr_to_mtl_buffer.end()) {
+          id<MTLBuffer> bias_buffer = bias_it->second;
+          
+          // Create bias placeholder
+          NSArray<NSNumber*>* biasShape = @[@(C_out)];
+          biasPlaceholder = [mpsGraph placeholderWithShape:biasShape
+                                                    dataType:MPSDataTypeFloat32
+                                                        name:@"bias"];
+          
+          // Add bias to convolution output
+          finalOutput = [mpsGraph additionWithPrimaryTensor:convOutput
+                                            secondaryTensor:biasPlaceholder
+                                                        name:@"add_bias"];
+          
+          ET_LOG(Debug, "aoti_torch_mps_convolution: Added bias placeholder to graph");
+        } else {
+          ET_LOG(Debug, "aoti_torch_mps_convolution: Bias tensor not found in Metal buffer mapping, skipping bias");
+        }
+      }
+
+      // Create feeds dictionary for graph execution
+      NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
+      
+      // Create MPSGraphTensorData objects for input tensors
+      MPSGraphTensorData* inputData = [[MPSGraphTensorData alloc] initWithMTLBuffer:input_buffer
+                                                                                shape:inputShape
+                                                                            dataType:MPSDataTypeFloat32];
+      MPSGraphTensorData* weightData = [[MPSGraphTensorData alloc] initWithMTLBuffer:weight_buffer
+                                                                                shape:weightShape
+                                                                            dataType:MPSDataTypeFloat32];
+      
+      feeds[inputPlaceholder] = inputData;
+      feeds[weightPlaceholder] = weightData;
+      
+      // Add bias data to feeds if provided
+      if (bias_tensor && biasPlaceholder) {
+        void* bias_data_ptr = bias_tensor->mutable_data_ptr();
+        auto bias_it = ptr_to_mtl_buffer.find(bias_data_ptr);
+        
+        if (bias_it != ptr_to_mtl_buffer.end()) {
+          id<MTLBuffer> bias_buffer = bias_it->second;
+          NSArray<NSNumber*>* biasShape = @[@(C_out)];
+          MPSGraphTensorData* biasData = [[MPSGraphTensorData alloc] initWithMTLBuffer:bias_buffer
+                                                                                    shape:biasShape
+                                                                                dataType:MPSDataTypeFloat32];
+          
+          feeds[biasPlaceholder] = biasData;
+          ET_LOG(Debug, "aoti_torch_mps_convolution: Added bias tensor to feeds");
+        }
+      }
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created feeds dictionary");
+
+      // Create or reuse output Metal buffer via AOTI API; keeps GPU residency
+      size_t output_size_bytes = N * C_out * H_out * W_out * sizeof(float);
+      void* output_contents_ptr = nullptr;
+      AOTITorchError malloc_err = aoti_torch_mps_malloc(&output_contents_ptr, output_size_bytes);
+      if (malloc_err != Error::Ok || !output_contents_ptr) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Failed to allocate Metal buffer via aoti_torch_mps_malloc");
+        throw std::runtime_error("Failed to allocate output Metal buffer");
+      }
+
+      auto out_it = ptr_to_mtl_buffer.find(output_contents_ptr);
+      if (out_it == ptr_to_mtl_buffer.end()) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: aoti_torch_mps_malloc did not register buffer in map");
+        throw std::runtime_error("Failed to look up allocated Metal buffer");
+      }
+      id<MTLBuffer> output_buffer = out_it->second;
+
+      // Create results dictionary (MPSGraph output is 4D)
+      NSArray<NSNumber*>* outputShape = @[@(N), @(C_out), @(H_out), @(W_out)];
+      MPSGraphTensorData* outputData = [[MPSGraphTensorData alloc] initWithMTLBuffer:output_buffer
+                                                                                shape:outputShape
+                                                                              dataType:MPSDataTypeFloat32];
+
+      NSDictionary* results = @{finalOutput: outputData};
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created results dictionary");
+
+      // Execute the MPSGraph
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Executing MPSGraph");
+      
+      @try {
+        // Use stream helper to encode and synchronize correctly
+        stream->executeMPSGraph(mpsGraph, feeds, results, SyncType::COMMIT_AND_CONTINUE);
+      } @catch (NSException *exception) {
+        ET_LOG(Error, "aoti_torch_mps_convolution: NSException caught during executeMPSGraph: %s - %s",
+              [[exception name] UTF8String], [[exception reason] UTF8String]);
+        throw std::runtime_error("MPSGraph execution failed with NSException");
+      }
+      // } @catch (const std::exception& e) {
+      //   ET_LOG(Error, "aoti_torch_mps_convolution exception: %s", e.what());
+      //   throw std::runtime_error("MPSGraph execution failed");
+      // }
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: MPSGraph execution completed successfully");
+
+      // Create output tensor handle on device (MPS) that points to GPU buffer
+      std::vector<int64_t> output_sizes_int64;
+      std::vector<int64_t> output_strides;
+      if (!is_conv1d && is_input_4d) {
+        output_sizes_int64 = {N, C_out, H_out, W_out};
+        // Contiguous NCHW strides
+        output_strides = {
+            C_out * H_out * W_out,
+            H_out * W_out,
+            W_out,
+            1
+        };
+      } else if (!is_conv1d) {
+        output_sizes_int64 = {C_out, H_out, W_out};
+        // Contiguous CHW strides
+        output_strides = {
+            H_out * W_out,
+            W_out,
+            1
+        };
+      } else if (is_conv1d && has_batch_dim) {
+        output_sizes_int64 = {N, C_out, W_out};
+        // Contiguous NCW strides
+        output_strides = {
+            C_out * W_out,
+            W_out,
+            1
+        };
+      } else {
+        output_sizes_int64 = {C_out, W_out};
+        // Contiguous CW strides
+        output_strides = {
+            W_out,
+            1
+        };
+      }
+
+      // Use the GPU buffer contents pointer directly for the tensor storage
+      void* tensor_data = output_contents_ptr;
 
       AOTITensorHandle output_tensor_handle = nullptr;
 
       AOTITorchError create_result = aoti_torch_create_tensor_from_blob_v2(
           tensor_data,
-          4,  // ndim
+          static_cast<int64_t>(output_sizes_int64.size()),  // ndim
           output_sizes_int64.data(),
           output_strides.data(),
           0,  // storage_offset
           static_cast<int32_t>(SupportedDTypes::FLOAT32),  // dtype
-          0,  // device_type (CPU)
+          2,  // device_type (MPS)
           0,  // device_index
           &output_tensor_handle,
           0,  // layout (strided)
@@ -415,26 +714,27 @@ AOTITorchError aoti_torch_mps_convolution(
 
       if (create_result != Error::Ok || !output_tensor_handle) {
         ET_LOG(Error, "aoti_torch_mps_convolution: Failed to create output tensor, error code: %d", static_cast<int>(create_result));
-        std::free(tensor_data);  // Free the allocated memory on failure
-        return Error::Internal;
+        aoti_torch_mps_free(tensor_data);  // Free the allocated GPU memory on failure
+        throw std::runtime_error("Failed to create output tensor");
       }
 
       // Verify the tensor was created with the correct size
       auto* et_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(output_tensor_handle);
       size_t actual_numel = et_tensor->numel();
-      ET_LOG(Debug, "aoti_torch_mps_convolution: Created tensor with actual numel = %zu", actual_numel);
+      size_t expected_numel = static_cast<size_t>(N * C_out * H_out * W_out);
 
       if (actual_numel != expected_numel) {
         ET_LOG(Error, "aoti_torch_mps_convolution: Tensor size mismatch. Expected %zu, got %zu", expected_numel, actual_numel);
-        std::free(tensor_data);  // Free the allocated memory on failure
-        return Error::Internal;
+        aoti_torch_mps_free(tensor_data);  // Free the allocated GPU memory on failure
+        throw std::runtime_error("Tensor size mismatch");
       }
 
       // Store the tensor handle - mark that we own the memory since we manually allocated it with malloc
       *ret0 = output_tensor_handle;
-      is_tensor_own_memory[et_tensor] = true;  // We allocated the memory manually
+      is_tensor_own_memory[et_tensor] = true;  // We allocated the GPU memory
 
-      ET_LOG(Debug, "aoti_torch_mps_convolution: Created zero-filled output tensor with %zu elements", actual_numel);
+      ET_LOG(Debug, "aoti_torch_mps_convolution: Created output tensor with %zu elements using MPSGraph", actual_numel);
+
       return Error::Ok;
 
     } catch (const std::exception& e) {
@@ -825,7 +1125,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           // Create completely independent Metal resources to avoid any conflicts
           id<MTLDevice> device = get_metal_device();
           id<MTLCommandQueue> independentQueue = [device newCommandQueue];
-          id<MTLCommandBuffer> independentCmdBuf = [independentQueue commandBuffer];
+          MPSCommandBuffer* independentCmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:independentQueue];
 
           if (!independentCmdBuf) {
             ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create independent command buffer");
