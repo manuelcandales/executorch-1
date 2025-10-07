@@ -905,32 +905,39 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
             1
         };
 
-        // Allocate memory for output tensors
+        // Allocate output Metal buffers via AOTI API to keep GPU residency and reuse
         size_t out_size_bytes = batchSize * num_heads * qSize * headSize * sizeof(float);
         size_t attn_size_bytes = batchSize * num_heads * qSize * kvSeqLength * sizeof(float);
 
-        void* out_data = std::malloc(out_size_bytes);
-        void* attn_data = std::malloc(attn_size_bytes);
-
-        if (!out_data || !attn_data) {
-          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to allocate memory");
-          if (out_data) std::free(out_data);
-          if (attn_data) std::free(attn_data);
-          throw std::runtime_error("Failed to allocate memory for output tensors");
+        void* out_contents_ptr = nullptr;
+        AOTITorchError out_malloc_err = aoti_torch_mps_malloc(&out_contents_ptr, out_size_bytes);
+        if (out_malloc_err != Error::Ok || !out_contents_ptr) {
+          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to allocate out buffer via aoti_torch_mps_malloc");
+          throw std::runtime_error("Failed to allocate output buffer");
         }
-
-        // Create Metal buffers for outputs
-        id<MTLBuffer> out_buffer = [device newBufferWithLength:out_size_bytes
-                                                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> attn_weights_buffer = [device newBufferWithLength:attn_size_bytes
-                                                                options:MTLResourceStorageModeShared];
-
-        if (!out_buffer || !attn_weights_buffer) {
-          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create output Metal buffers");
-          std::free(out_data);
-          std::free(attn_data);
-          throw std::runtime_error("Failed to create output Metal buffers");
+        auto out_map_it = ptr_to_mtl_buffer.find(out_contents_ptr);
+        if (out_map_it == ptr_to_mtl_buffer.end()) {
+          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: out buffer not found in mapping after malloc");
+          aoti_torch_mps_free(out_contents_ptr);
+          throw std::runtime_error("Mapping for out buffer missing");
         }
+        id<MTLBuffer> out_buffer = out_map_it->second;
+
+        void* attn_contents_ptr = nullptr;
+        AOTITorchError attn_malloc_err = aoti_torch_mps_malloc(&attn_contents_ptr, attn_size_bytes);
+        if (attn_malloc_err != Error::Ok || !attn_contents_ptr) {
+          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to allocate attn buffer via aoti_torch_mps_malloc");
+          aoti_torch_mps_free(out_contents_ptr);
+          throw std::runtime_error("Failed to allocate attn buffer");
+        }
+        auto attn_map_it = ptr_to_mtl_buffer.find(attn_contents_ptr);
+        if (attn_map_it == ptr_to_mtl_buffer.end()) {
+          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: attn buffer not found in mapping after malloc");
+          aoti_torch_mps_free(out_contents_ptr);
+          aoti_torch_mps_free(attn_contents_ptr);
+          throw std::runtime_error("Mapping for attn buffer missing");
+        }
+        id<MTLBuffer> attn_weights_buffer = attn_map_it->second;
 
         // End any existing kernel coalescing to ensure a clean state for MPS
         stream->endKernelCoalescing();
@@ -1119,42 +1126,9 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           NSDictionary* results = @{outputTensor: outputData};
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created results dictionary");
 
-          // Execute the MPSGraph using a completely independent Metal infrastructure
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Executing MPSGraph with independent Metal resources");
-
-          // Create completely independent Metal resources to avoid any conflicts
-          id<MTLDevice> device = get_metal_device();
-          id<MTLCommandQueue> independentQueue = [device newCommandQueue];
-          MPSCommandBuffer* independentCmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:independentQueue];
-
-          if (!independentCmdBuf) {
-            ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create independent command buffer");
-            throw std::runtime_error("Failed to create independent command buffer");
-          }
-
-          // Use the correct MPSGraph API with resultsDictionary
-          [mpsGraph encodeToCommandBuffer:independentCmdBuf
-                                    feeds:feeds
-                         targetOperations:nil
-                        resultsDictionary:results
-                      executionDescriptor:nil];
-
-          // Commit and wait for completion
-          [independentCmdBuf commit];
-          [independentCmdBuf waitUntilCompleted];
-
-          // Check for errors
-          if (independentCmdBuf.status == MTLCommandBufferStatusError) {
-            NSString* errorDesc = independentCmdBuf.error ? independentCmdBuf.error.description : @"Unknown error";
-            ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Command buffer execution failed: %s", [errorDesc UTF8String]);
-            throw std::runtime_error("Command buffer execution failed");
-          }
-
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph execution completed successfully");
-
-          // Copy results back to CPU memory
-          memcpy(out_data, [out_buffer contents], out_size_bytes);
-
+          // Execute via shared stream and keep results on GPU
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Executing MPSGraph using stream");
+          stream->executeMPSGraph(mpsGraph, feeds, results, SyncType::COMMIT_AND_CONTINUE);
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: MPSGraph execution completed successfully");
 
         } @catch (NSException *exception) {
@@ -1163,22 +1137,21 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           throw std::runtime_error("MPSGraph operation failed with NSException");
         }
 
-        // For attention weights, we'll create a dummy tensor filled with zeros for now
-        // In a full implementation, you'd need to extract attention weights from the graph
-        std::memset(attn_data, 0, attn_size_bytes);
+        // For attention weights, zero-fill the GPU buffer (shared memory allows CPU memset)
+        std::memset(attn_contents_ptr, 0, attn_size_bytes);
 
         // Create output tensor handles
         AOTITensorHandle out_tensor_handle = nullptr;
         AOTITensorHandle attn_tensor_handle = nullptr;
 
         AOTITorchError create_out_result = aoti_torch_create_tensor_from_blob_v2(
-            out_data,
+            out_contents_ptr,
             4,  // ndim
             output_sizes.data(),
             out_strides.data(),
             0,  // storage_offset
             static_cast<int32_t>(SupportedDTypes::FLOAT32),
-            0,  // device_type (CPU)
+            2,  // device_type (MPS)
             0,  // device_index
             &out_tensor_handle,
             0,  // layout (strided)
@@ -1187,13 +1160,13 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         );
 
         AOTITorchError create_attn_result = aoti_torch_create_tensor_from_blob_v2(
-            attn_data,
+            attn_contents_ptr,
             4,  // ndim
             attn_sizes.data(),
             attn_strides.data(),
             0,  // storage_offset
             static_cast<int32_t>(SupportedDTypes::FLOAT32),
-            0,  // device_type (CPU)
+            2,  // device_type (MPS)
             0,  // device_index
             &attn_tensor_handle,
             0,  // layout (strided)
@@ -1204,8 +1177,8 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         if (create_out_result != Error::Ok || create_attn_result != Error::Ok ||
             !out_tensor_handle || !attn_tensor_handle) {
           ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create output tensors");
-          std::free(out_data);
-          std::free(attn_data);
+          aoti_torch_mps_free(out_contents_ptr);
+          aoti_torch_mps_free(attn_contents_ptr);
           throw std::runtime_error("Failed to create output tensors");
         }
 
