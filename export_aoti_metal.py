@@ -276,6 +276,24 @@ class Whisper(torch.nn.Module):
         return outputs.last_hidden_state
 
 
+class SmallConv1d(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels=8,
+            out_channels=6,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            dilation=1,
+            groups=1,
+            bias=False,
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
 class MockConv1d(nn.Module):
     def __init__(self):
         super().__init__()
@@ -482,6 +500,11 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "model_class": Whisper,
         "input_shapes": [(1, 80, 3000)],
         "description": "OpenAI Whisper ASR model. now is encoder only",
+    },
+    "small_conv1d": {
+        "model_class": SmallConv1d,
+        "input_shapes": [(1, 8, 5)],
+        "description": "Conv1d layer with 8 input channels, 6 output channels",
     },
     "conv1d": {
         "model_class": MockConv1d,
