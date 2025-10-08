@@ -512,7 +512,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
 
 
 def get_model_and_inputs(
-    model_name: str,
+    model_name: str, dtype: torch.dtype = None,
 ) -> Tuple[torch.nn.Module, Tuple[torch.Tensor, ...]]:
     """Get model and example inputs based on model name."""
     #
@@ -530,12 +530,19 @@ def get_model_and_inputs(
     # Create model instance
     model = model_class().to(device).eval()
 
+    if dtype is not None:
+        print(f"Setting model to dtype {dtype}")
+        model = model.to(dtype)
+    else:
+        print(f"Setting model to dtype float32")
+        dtype = torch.float32
+
     # Create example inputs (support multiple inputs)
     example_inputs = tuple(
         (
             torch.randint(0, 10000, size=shape, device=device)
             if model_name == "llama31"
-            else torch.randn(*shape, device=device)
+            else torch.randn(*shape, device=device, dtype=dtype)
         )
         for shape in input_shapes
     )
@@ -695,6 +702,19 @@ def main():
         metavar="model_name",
     )
 
+    # # Add dtype as optional argument
+    # parser.add_argument(
+    #     "dtype",
+    #     help="Data type to export the model with",
+    #     choices=["float32", "bfloat16"],
+    #     default="float32",
+    # )
+
+    # dtype_map = {
+    #     "float32": torch.float32,
+    #     "bfloat16": torch.bfloat16,
+    # }
+
     # Add the --aoti_only flag
     parser.add_argument(
         "--aoti_only",
@@ -715,7 +735,8 @@ def main():
         sys.exit(1)
 
     try:
-        model, example_inputs = get_model_and_inputs(args.model_name)
+        #print(f"Getting model and inputs with dtype {args.dtype}")
+        model, example_inputs = get_model_and_inputs(args.model_name, torch.bfloat16)
 
         # Choose export function based on --aoti_only flag
         if args.aoti_only:

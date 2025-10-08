@@ -284,6 +284,7 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
       auto cpu_tensor = &(args[i]->toTensor());
       auto sizes = cpu_tensor->sizes();
       auto scalar_type = cpu_tensor->scalar_type();
+      ET_LOG(Debug, "MetalBackend input %d scalar_type=%d", i, static_cast<int32_t>(scalar_type));
 
       // Create GPU tensor with same shape
       std::vector<int64_t> sizes_vec(sizes.begin(), sizes.end());
@@ -303,6 +304,10 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
         return Error::Internal;
       }
 
+      // Log the created GPU tensor scalar type
+      auto gpu_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(gpu_input_handle);
+      ET_LOG(Debug, "MetalBackend created GPU tensor %d scalar_type=%d", i, static_cast<int32_t>(gpu_tensor->scalar_type()));
+
       gpu_inputs[i] = gpu_input_handle;
 
       // Log the CPU tensor data before copying to GPU
@@ -320,6 +325,10 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
         return Error::Internal;
       }
 
+      // Log the GPU tensor scalar type after copy
+      auto gpu_tensor_after = reinterpret_cast<executorch::runtime::etensor::Tensor*>(gpu_inputs[i]);
+      ET_LOG(Debug, "MetalBackend GPU tensor %d scalar_type after copy=%d", i, static_cast<int32_t>(gpu_tensor_after->scalar_type()));
+
       ET_LOG(Debug, "Successfully copied input %d from CPU to GPU", i);
     }
 
@@ -332,6 +341,7 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
       auto cpu_output_tensor = &(args[i + n_inputs]->toTensor());
       auto sizes = cpu_output_tensor->sizes();
       auto scalar_type = cpu_output_tensor->scalar_type();
+      ET_LOG(Debug, "MetalBackend output %d scalar_type=%d", i, static_cast<int32_t>(scalar_type));
 
       // Create GPU tensor with same shape for kernel output
       std::vector<int64_t> sizes_vec(sizes.begin(), sizes.end());

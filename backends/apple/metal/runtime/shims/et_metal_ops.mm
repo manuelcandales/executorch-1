@@ -137,27 +137,50 @@ AOTITorchError aoti_torch_mps_mm_out(
           throw std::runtime_error("Failed to get command buffer from stream");
         }
 
+        // Determine data type and element size
+        int32_t dtype = static_cast<int32_t>(self_tensor->scalar_type());
+        MPSDataType mps_dtype;
+        size_t element_size;
+        
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: self_tensor scalar_type=%d, SupportedDTypes::FLOAT32=%d, SupportedDTypes::BFLOAT16=%d", 
+               dtype, static_cast<int32_t>(SupportedDTypes::FLOAT32), static_cast<int32_t>(SupportedDTypes::BFLOAT16));
+        
+        if (dtype == static_cast<int32_t>(SupportedDTypes::FLOAT32)) {
+          mps_dtype = MPSDataTypeFloat32;
+          element_size = sizeof(float);
+        } else if (dtype == static_cast<int32_t>(SupportedDTypes::BFLOAT16)) {
+          mps_dtype = MPSDataTypeBFloat16;
+          element_size = sizeof(uint16_t);  // bfloat16 is 16 bits
+        } else {
+          ET_LOG(Error, "aoti_torch_mps_mm_out: Unsupported data type: %d", dtype);
+          throw std::runtime_error("Unsupported data type for matrix multiplication");
+        }
+
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: dtype=%d, element_size=%zu", dtype, element_size);
+
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: M=%lld, K=%lld, N=%lld", M, K, N);
+
         // Create matrix descriptors for the multiplication
         MPSMatrixDescriptor* selfDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
                                                                               columns:K
                                                                              matrices:1
-                                                                             rowBytes:K * sizeof(float)
-                                                                          matrixBytes:M * K * sizeof(float)
-                                                                             dataType:MPSDataTypeFloat32];
+                                                                             rowBytes:K * element_size
+                                                                          matrixBytes:M * K * element_size
+                                                                             dataType:mps_dtype];
 
         MPSMatrixDescriptor* mat2Desc = [MPSMatrixDescriptor matrixDescriptorWithRows:K
                                                                               columns:N
                                                                              matrices:1
-                                                                             rowBytes:N * sizeof(float)
-                                                                          matrixBytes:K * N * sizeof(float)
-                                                                             dataType:MPSDataTypeFloat32];
+                                                                             rowBytes:N * element_size
+                                                                          matrixBytes:K * N * element_size
+                                                                             dataType:mps_dtype];
 
         MPSMatrixDescriptor* outDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:M
                                                                              columns:N
                                                                             matrices:1
-                                                                            rowBytes:N * sizeof(float)
-                                                                         matrixBytes:M * N * sizeof(float)
-                                                                            dataType:MPSDataTypeFloat32];
+                                                                            rowBytes:N * element_size
+                                                                         matrixBytes:M * N * element_size
+                                                                            dataType:mps_dtype];
 
         MPSMatrix* selfMatrix = [[MPSMatrix alloc] initWithBuffer:self_buffer
                                                            offset:0
@@ -468,6 +491,24 @@ AOTITorchError aoti_torch_mps_convolution(
 
       // Ensure stream is ready; command buffer handled internally by stream helpers
 
+      // Determine data type and element size
+      int32_t dtype = static_cast<int32_t>(input_tensor->scalar_type());
+      MPSDataType mps_dtype;
+      size_t element_size;
+      
+      if (dtype == static_cast<int32_t>(SupportedDTypes::FLOAT32)) {
+        mps_dtype = MPSDataTypeFloat32;
+        element_size = sizeof(float);
+      } else if (dtype == static_cast<int32_t>(SupportedDTypes::BFLOAT16)) {
+        mps_dtype = MPSDataTypeBFloat16;
+        element_size = sizeof(uint16_t);  // bfloat16 is 16 bits
+      } else {
+        ET_LOG(Error, "aoti_torch_mps_convolution: Unsupported data type: %d", dtype);
+        throw std::runtime_error("Unsupported data type for convolution");
+      }
+
+      ET_LOG(Debug, "aoti_torch_mps_convolution: mps_dtype=%d, element_size=%zu", mps_dtype, element_size);
+
       // Create MPSGraph for convolution
       MPSGraph* mpsGraph = [MPSGraph new];
       ET_LOG(Debug, "aoti_torch_mps_convolution: Created MPSGraph instance");
@@ -482,10 +523,10 @@ AOTITorchError aoti_torch_mps_convolution(
 
       // Create placeholders for input tensors
       MPSGraphTensor* inputPlaceholder = [mpsGraph placeholderWithShape:inputShape
-                                                                dataType:MPSDataTypeFloat32
+                                                                dataType:mps_dtype
                                                                     name:@"input"];
       MPSGraphTensor* weightPlaceholder = [mpsGraph placeholderWithShape:weightShape
-                                                                  dataType:MPSDataTypeFloat32
+                                                                  dataType:mps_dtype
                                                                       name:@"weight"];
 
       ET_LOG(Debug, "aoti_torch_mps_convolution: Created input and weight placeholders");
@@ -565,7 +606,7 @@ AOTITorchError aoti_torch_mps_convolution(
           // Create bias placeholder
           NSArray<NSNumber*>* biasShape = @[@(C_out)];
           biasPlaceholder = [mpsGraph placeholderWithShape:biasShape
-                                                    dataType:MPSDataTypeFloat32
+                                                    dataType:mps_dtype
                                                         name:@"bias"];
           
           // Add bias to convolution output
@@ -585,10 +626,10 @@ AOTITorchError aoti_torch_mps_convolution(
       // Create MPSGraphTensorData objects for input tensors
       MPSGraphTensorData* inputData = [[MPSGraphTensorData alloc] initWithMTLBuffer:input_buffer
                                                                                 shape:inputShape
-                                                                            dataType:MPSDataTypeFloat32];
+                                                                            dataType:mps_dtype];
       MPSGraphTensorData* weightData = [[MPSGraphTensorData alloc] initWithMTLBuffer:weight_buffer
                                                                                 shape:weightShape
-                                                                            dataType:MPSDataTypeFloat32];
+                                                                            dataType:mps_dtype];
       
       feeds[inputPlaceholder] = inputData;
       feeds[weightPlaceholder] = weightData;
@@ -603,7 +644,7 @@ AOTITorchError aoti_torch_mps_convolution(
           NSArray<NSNumber*>* biasShape = @[@(C_out)];
           MPSGraphTensorData* biasData = [[MPSGraphTensorData alloc] initWithMTLBuffer:bias_buffer
                                                                                     shape:biasShape
-                                                                                dataType:MPSDataTypeFloat32];
+                                                                                dataType:mps_dtype];
           
           feeds[biasPlaceholder] = biasData;
           ET_LOG(Debug, "aoti_torch_mps_convolution: Added bias tensor to feeds");
@@ -613,7 +654,7 @@ AOTITorchError aoti_torch_mps_convolution(
       ET_LOG(Debug, "aoti_torch_mps_convolution: Created feeds dictionary");
 
       // Create or reuse output Metal buffer via AOTI API; keeps GPU residency
-      size_t output_size_bytes = N * C_out * H_out * W_out * sizeof(float);
+      size_t output_size_bytes = N * C_out * H_out * W_out * element_size;
       void* output_contents_ptr = nullptr;
       AOTITorchError malloc_err = aoti_torch_mps_malloc(&output_contents_ptr, output_size_bytes);
       if (malloc_err != Error::Ok || !output_contents_ptr) {
@@ -632,7 +673,7 @@ AOTITorchError aoti_torch_mps_convolution(
       NSArray<NSNumber*>* outputShape = @[@(N), @(C_out), @(H_out), @(W_out)];
       MPSGraphTensorData* outputData = [[MPSGraphTensorData alloc] initWithMTLBuffer:output_buffer
                                                                                 shape:outputShape
-                                                                              dataType:MPSDataTypeFloat32];
+                                                                              dataType:mps_dtype];
 
       NSDictionary* results = @{finalOutput: outputData};
       ET_LOG(Debug, "aoti_torch_mps_convolution: Created results dictionary");
@@ -703,7 +744,7 @@ AOTITorchError aoti_torch_mps_convolution(
           output_sizes_int64.data(),
           output_strides.data(),
           0,  // storage_offset
-          static_cast<int32_t>(SupportedDTypes::FLOAT32),  // dtype
+          dtype,  // dtype
           2,  // device_type (MPS)
           0,  // device_index
           &output_tensor_handle,
@@ -817,6 +858,24 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: batchSize=%lld, num_heads=%lld, qSize=%lld, headSize=%lld, kvSeqLength=%lld",
                batchSize, num_heads, qSize, headSize, kvSeqLength);
 
+        // Determine data type and element size
+        int32_t dtype = static_cast<int32_t>(query_tensor->scalar_type());
+        MPSDataType mps_dtype;
+        size_t element_size;
+        
+        if (dtype == static_cast<int32_t>(SupportedDTypes::FLOAT32)) {
+          mps_dtype = MPSDataTypeFloat32;
+          element_size = sizeof(float);
+        } else if (dtype == static_cast<int32_t>(SupportedDTypes::BFLOAT16)) {
+          mps_dtype = MPSDataTypeBFloat16;
+          element_size = sizeof(uint16_t);  // bfloat16 is 16 bits
+        } else {
+          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Unsupported data type: %d", dtype);
+          throw std::runtime_error("Unsupported data type for scaled dot product attention");
+        }
+
+        ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: mps_dtype=%d, element_size=%zu", mps_dtype, element_size);
+
         // Calculate scale factor
         double scale_factor = scale ? *scale : (1.0 / sqrt(static_cast<double>(headSize)));
         ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: scale_factor=%f", scale_factor);
@@ -854,7 +913,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
 
         // Create temporary Metal buffers if not found in mapping
         if (!query_buffer) {
-          size_t query_size = query_tensor->numel() * sizeof(float);
+          size_t query_size = query_tensor->numel() * element_size;
           query_buffer = [device newBufferWithBytes:query_data_ptr
                                              length:query_size
                                             options:MTLResourceStorageModeShared];
@@ -865,7 +924,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         }
 
         if (!key_buffer) {
-          size_t key_size = key_tensor->numel() * sizeof(float);
+          size_t key_size = key_tensor->numel() * element_size;
           key_buffer = [device newBufferWithBytes:key_data_ptr
                                            length:key_size
                                           options:MTLResourceStorageModeShared];
@@ -876,7 +935,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         }
 
         if (!value_buffer) {
-          size_t value_size = value_tensor->numel() * sizeof(float);
+          size_t value_size = value_tensor->numel() * element_size;
           value_buffer = [device newBufferWithBytes:value_data_ptr
                                              length:value_size
                                             options:MTLResourceStorageModeShared];
@@ -906,8 +965,8 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         };
 
         // Allocate output Metal buffers via AOTI API to keep GPU residency and reuse
-        size_t out_size_bytes = batchSize * num_heads * qSize * headSize * sizeof(float);
-        size_t attn_size_bytes = batchSize * num_heads * qSize * kvSeqLength * sizeof(float);
+        size_t out_size_bytes = batchSize * num_heads * qSize * headSize * element_size;
+        size_t attn_size_bytes = batchSize * num_heads * qSize * kvSeqLength * element_size;
 
         void* out_contents_ptr = nullptr;
         AOTITorchError out_malloc_err = aoti_torch_mps_malloc(&out_contents_ptr, out_size_bytes);
@@ -970,17 +1029,17 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
 
           // Create placeholders for input tensors
           MPSGraphTensor* queryPlaceholder = [mpsGraph placeholderWithShape:queryShape
-                                                                   dataType:MPSDataTypeFloat32
+                                                                   dataType:mps_dtype
                                                                        name:@"query"];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created query placeholder");
 
           MPSGraphTensor* keyPlaceholder = [mpsGraph placeholderWithShape:keyShape
-                                                                 dataType:MPSDataTypeFloat32
+                                                                 dataType:mps_dtype
                                                                      name:@"key"];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created key placeholder");
 
           MPSGraphTensor* valuePlaceholder = [mpsGraph placeholderWithShape:valueShape
-                                                                   dataType:MPSDataTypeFloat32
+                                                                   dataType:mps_dtype
                                                                        name:@"value"];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created value placeholder");
 
@@ -997,7 +1056,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
             // Create ones tensor
             MPSGraphTensor* onesTensor = [mpsGraph constantWithScalar:1.0f
                                                                 shape:maskShape
-                                                             dataType:MPSDataTypeFloat32];
+                                                             dataType:mps_dtype];
             ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created ones tensor for causal mask");
 
             // Create lower triangular mask (including diagonal)
@@ -1010,11 +1069,11 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
             // Convert mask to attention weights format: 0 for allowed positions, -inf for masked
             MPSGraphTensor* zerosTensor = [mpsGraph constantWithScalar:0.0f
                                                                  shape:maskShape
-                                                              dataType:MPSDataTypeFloat32];
+                                                              dataType:mps_dtype];
 
             MPSGraphTensor* negInfTensor = [mpsGraph constantWithScalar:-1e9f
                                                                   shape:maskShape
-                                                               dataType:MPSDataTypeFloat32];
+                                                               dataType:mps_dtype];
 
             // Select: where causal_mask == 1, use 0.0, else use -inf
             maskTensor = [mpsGraph selectWithPredicateTensor:causalMask
@@ -1038,7 +1097,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
             }
 
             explicitMaskPlaceholder = [mpsGraph placeholderWithShape:maskShapeArray
-                                                            dataType:MPSDataTypeFloat32
+                                                            dataType:mps_dtype
                                                                 name:@"attention_mask"];
 
             if (maskTensor) {
@@ -1070,13 +1129,13 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           // Create MPSGraphTensorData objects for input tensors
           MPSGraphTensorData* queryData = [[MPSGraphTensorData alloc] initWithMTLBuffer:query_buffer
                                                                                   shape:queryShape
-                                                                               dataType:MPSDataTypeFloat32];
+                                                                               dataType:mps_dtype];
           MPSGraphTensorData* keyData = [[MPSGraphTensorData alloc] initWithMTLBuffer:key_buffer
                                                                                 shape:keyShape
-                                                                             dataType:MPSDataTypeFloat32];
+                                                                             dataType:mps_dtype];
           MPSGraphTensorData* valueData = [[MPSGraphTensorData alloc] initWithMTLBuffer:value_buffer
                                                                                   shape:valueShape
-                                                                               dataType:MPSDataTypeFloat32];
+                                                                               dataType:mps_dtype];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created MPSGraphTensorData objects for inputs");
 
           feeds[queryPlaceholder] = queryData;
@@ -1095,7 +1154,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
             if (mask_it != ptr_to_mtl_buffer.end()) {
               mask_buffer = mask_it->second;
             } else {
-              size_t mask_size = mask_tensor->numel() * sizeof(float);
+              size_t mask_size = mask_tensor->numel() * element_size;
               mask_buffer = [device newBufferWithBytes:mask_data_ptr
                                                 length:mask_size
                                                options:MTLResourceStorageModeShared];
@@ -1112,7 +1171,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
 
             MPSGraphTensorData* maskData = [[MPSGraphTensorData alloc] initWithMTLBuffer:mask_buffer
                                                                                    shape:maskShapeArray
-                                                                                dataType:MPSDataTypeFloat32];
+                                                                                dataType:mps_dtype];
             feeds[explicitMaskPlaceholder] = maskData;
             ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Added explicit mask tensor to feeds");
           }
@@ -1121,7 +1180,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           NSArray<NSNumber*>* outputShape = @[@(batchSize), @(num_heads), @(qSize), @(headSize)];
           MPSGraphTensorData* outputData = [[MPSGraphTensorData alloc] initWithMTLBuffer:out_buffer
                                                                                     shape:outputShape
-                                                                                 dataType:MPSDataTypeFloat32];
+                                                                                 dataType:mps_dtype];
 
           NSDictionary* results = @{outputTensor: outputData};
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created results dictionary");
@@ -1150,7 +1209,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
             output_sizes.data(),
             out_strides.data(),
             0,  // storage_offset
-            static_cast<int32_t>(SupportedDTypes::FLOAT32),
+            dtype,
             2,  // device_type (MPS)
             0,  // device_index
             &out_tensor_handle,
@@ -1165,7 +1224,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
             attn_sizes.data(),
             attn_strides.data(),
             0,  // storage_offset
-            static_cast<int32_t>(SupportedDTypes::FLOAT32),
+            dtype,
             2,  // device_type (MPS)
             0,  // device_index
             &attn_tensor_handle,
