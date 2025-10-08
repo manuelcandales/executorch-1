@@ -65,6 +65,10 @@ xcuserdata/
 *.csv
 *_etdump
 
+# AOTI debug data
+aoti_debug_data/final_runtime_output.txt
+aoti_debug_data/label_output.txt
+
 # Android
 *.aar
 
