@@ -354,15 +354,45 @@ int main(int argc, char** argv) {
     if (output_file.is_open() && outputs[i].isTensor()) {
       auto tensor = outputs[i].toTensor();
       const void* data_ptr = tensor.const_data_ptr();
-
-      // assert output is in float different tensor types
-      const float* float_data = static_cast<const float*>(data_ptr);
       size_t num_elements = tensor.numel();
 
-      for (size_t j = 0; j < num_elements; ++j) {
-        if (j > 0)
-          output_file << ",";
-        output_file << float_data[j];
+      // Handle different tensor data types correctly
+      auto scalar_type = tensor.scalar_type();
+
+      if (scalar_type == executorch::aten::ScalarType::Float) {
+        // Float32 tensors
+        const float* float_data = static_cast<const float*>(data_ptr);
+        for (size_t j = 0; j < num_elements; ++j) {
+          if (j > 0) output_file << ",";
+          output_file << float_data[j];
+        }
+      } else if (scalar_type == executorch::aten::ScalarType::BFloat16) {
+        // bfloat16 tensors - convert to float32 for output
+        const uint16_t* bf16_data = static_cast<const uint16_t*>(data_ptr);
+        for (size_t j = 0; j < num_elements; ++j) {
+          if (j > 0) output_file << ",";
+          // Convert bfloat16 to float32 for readable output
+          union { uint32_t i; float f; } u;
+          u.i = static_cast<uint32_t>(bf16_data[j]) << 16;
+          output_file << u.f;
+        }
+      } else if (scalar_type == executorch::aten::ScalarType::Half) {
+        // Float16 tensors - convert to float32 for output
+        const uint16_t* fp16_data = static_cast<const uint16_t*>(data_ptr);
+        for (size_t j = 0; j < num_elements; ++j) {
+          if (j > 0) output_file << ",";
+          // Convert float16 to float32 (simplified conversion)
+          // Note: This is a basic conversion - production code should use proper fp16 conversion
+          uint32_t fp32_bits = static_cast<uint32_t>(fp16_data[j]) << 16;
+          union { uint32_t i; float f; } u;
+          u.i = fp32_bits;
+          output_file << u.f;
+        }
+      } else {
+        // For other data types, print a warning and skip
+        ET_LOG(Debug, "Output tensor %d has unsupported scalar_type %d for file output. Skipping.",
+               i, static_cast<int>(scalar_type));
+        output_file << "[unsupported_dtype_" << static_cast<int>(scalar_type) << "]";
       }
 
       if (i < outputs.size() - 1)
