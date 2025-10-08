@@ -176,9 +176,9 @@ __attribute__((__visibility__("default"))) int32_t aoti_torch_dtype_float32() {
 //   return static_cast<int32_t>(SupportedDTypes::FLOAT64);
 // }
 //
-// __attribute__((__visibility__("default"))) int32_t aoti_torch_dtype_bfloat16() {
-//   return static_cast<int32_t>(SupportedDTypes::BFLOAT16);
-// }
+__attribute__((__visibility__("default"))) int32_t aoti_torch_dtype_bfloat16() {
+  return static_cast<int32_t>(SupportedDTypes::BFLOAT16);
+}
 
 size_t aoti_torch_dtype_element_size(int32_t dtype) {
   return dtype_to_element_size(dtype);

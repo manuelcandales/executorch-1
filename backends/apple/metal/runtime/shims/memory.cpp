@@ -316,7 +316,8 @@ AOTITorchError aoti_torch_empty_strided(
   }
 
   // ETensor creation
-  auto tensor = executorch::extension::from_blob(ptr, sizes, strides);
+  executorch::aten::ScalarType scalar_type = dtype_to_scalar_type(dtype);
+  auto tensor = executorch::extension::from_blob(ptr, sizes, strides, scalar_type);
 
   // Store the tensor so it doesn't get destroyed
   tensors.insert(tensor);

@@ -62,6 +62,7 @@ int32_t aoti_torch_device_type_cpu();
 int32_t aoti_torch_device_type_mps();
 int32_t aoti_torch_layout_strided();
 int32_t aoti_torch_dtype_float32();
+int32_t aoti_torch_dtype_bfloat16();
 
 // Autograd mode functions
 int32_t aoti_torch_grad_mode_is_enabled();
