@@ -7,6 +7,7 @@
  */
 
 #include "memory.h"
+#include <executorch/backends/aoti/utils.h>
 #include <executorch/runtime/platform/log.h>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,9 @@
 namespace executorch {
 namespace backends {
 namespace metal {
+
+// Import all from aoti namespace
+using namespace executorch::backends::aoti;
 
 namespace { // Internal namespace for utility functions
 

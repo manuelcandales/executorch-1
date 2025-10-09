@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <executorch/backends/aoti/utils.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include <cstdint>
 #include "types.h"
@@ -32,25 +33,14 @@ enum class SupportedDTypes : int32_t {
 
 extern "C" {
 
-// Helper function to check if a dtype is supported
+// Helper function to check if a dtype is supported in Metal backend
 bool is_dtype_supported_in_et_metal(int32_t dtype);
-
-// Map int32_t dtype to number of bytes per element (reusing ExecutorTorch's
-// elementSize function)
-size_t dtype_to_element_size(int32_t dtype);
-
-// Map int32_t dtype to ExecutorTorch ScalarType (robust version of hardcoded
-// ScalarType::Float)
-executorch::aten::ScalarType dtype_to_scalar_type(int32_t dtype);
 
 // Cleanup function for tensor output file (called during backend destruction)
 void cleanup_aoti_tensor_output();
 
-// Dtype validation utility function
+// Metal-specific dtype validation utility function
 AOTITorchError validate_dtype(int32_t dtype);
-
-// Storage offset validation utility function
-AOTITorchError validate_storage_offset(int64_t storage_offset);
 
 } // extern "C"
 

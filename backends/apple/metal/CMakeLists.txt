@@ -27,7 +27,6 @@ find_package_torch()
 
 set(_aoti_metal_sources
     runtime/metal_backend.cpp
-    runtime/aoti_model_container.cpp
     runtime/shims/memory.cpp
     runtime/shims/et_metal.mm
     runtime/shims/et_metal_ops.mm
@@ -78,6 +77,7 @@ endif()
 target_link_libraries(
   metal_backend
   PUBLIC
+    aoti_common
     extension_tensor
     ${CMAKE_DL_LIBS}
     ${TORCH_OMP_LIBRARY}

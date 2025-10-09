@@ -25,8 +25,11 @@
 #include <memory>
 #include <vector>
 
-// Include our shim layer headers
-#include "aoti_model_container.h"
+// Include AOTI common headers (from aoti_common library)
+#include <executorch/backends/aoti/aoti_model_container.h>
+#include <executorch/backends/aoti/common_shims.h>
+
+// Include our Metal-specific shim layer headers
 #include "shims/memory.h"
 #include "shims/tensor_attribute.h"
 #include "shims/utils.h"
@@ -37,6 +40,7 @@ namespace backends {
 namespace metal {
 
 using namespace std;
+using namespace aoti;
 
 using executorch::aten::ScalarType;
 using executorch::runtime::ArrayRef;
@@ -457,7 +461,7 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
 
     free(handle);
     cleanup_memory();
-    cleanup_tensor_metadata();
+    executorch::backends::aoti::cleanup_tensor_metadata();
     cleanup_aoti_tensor_output();
     ET_LOG(Debug, "MetalBackend handle %p destroy", handle_);
   }
