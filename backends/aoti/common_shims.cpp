@@ -145,6 +145,10 @@ void cleanup_tensor_metadata() {
   internal::tensor_to_strides.clear();
 }
 
+size_t aoti_torch_dtype_element_size(int32_t dtype) {
+  return dtype_to_element_size(dtype);
+}
+
 } // extern "C"
 
 } // namespace aoti
