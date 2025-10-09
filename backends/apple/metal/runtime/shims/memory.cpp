@@ -429,128 +429,6 @@ AOTITorchError aoti_torch_copy_(
   aoti_torch_get_sizes(self, &self_sizes);
   aoti_torch_get_sizes(src, &src_sizes);
 
-  // Fast-path: if dims differ but total bytes equal and both are contiguous,
-  // allow a raw copy (treat as a reshape-compatible copy).
-  if (self->dim() != src->dim()) {
-    size_t self_bytes = self->nbytes();
-    size_t src_bytes = src->nbytes();
-
-    bool self_contig = is_tensor_contiguous(self->dim(), self_sizes, self_strides);
-    bool src_contig = is_tensor_contiguous(src->dim(), src_sizes, src_strides);
-
-    if (self_bytes == src_bytes && self_contig && src_contig) {
-      // Determine device locations
-      bool srcIsDevice = metal_is_device_pointer(const_cast<void*>(src->data_ptr()));
-      bool dstIsDevice = metal_is_device_pointer(self->mutable_data_ptr());
-
-      if (srcIsDevice && dstIsDevice) {
-        int result = metal_copy_memory(
-            self->mutable_data_ptr(),
-            src->data_ptr(),
-            self_bytes,
-            true,
-            true);
-        if (result != 0) {
-          ET_LOG(Error, "Failed to copy (reshape-compatible) from Metal device to device");
-          return Error::Internal;
-        }
-      } else if (srcIsDevice && !dstIsDevice) {
-        int result = metal_copy_memory(
-            self->mutable_data_ptr(),
-            src->data_ptr(),
-            self_bytes,
-            true,
-            false);
-        if (result != 0) {
-          ET_LOG(Error, "Failed to copy (reshape-compatible) from Metal device to host");
-          return Error::Internal;
-        }
-      } else if (!srcIsDevice && dstIsDevice) {
-        int result = metal_copy_memory(
-            self->mutable_data_ptr(),
-            src->data_ptr(),
-            self_bytes,
-            false,
-            true);
-        if (result != 0) {
-          ET_LOG(Error, "Failed to copy (reshape-compatible) from host to Metal device");
-          return Error::Internal;
-        }
-      } else {
-        std::memcpy(self->mutable_data_ptr(), src->data_ptr(), self_bytes);
-      }
-      return Error::Ok;
-    }
-
-    ET_LOG(
-        Error,
-        "dimension mismatch. self.dim()=%zd, src.dim()=%zd",
-        self->dim(),
-        src->dim());
-    return Error::InvalidArgument;
-  }
-
-  // Check if tensors have the same tensor schema (sizes, strides, dtype)
-  bool same_schema = true;
-
-  // Check schema match
-  for (int i = 0; i < self->dim(); i++) {
-    if (self_sizes[i] != src_sizes[i] || self_strides[i] != src_strides[i]) {
-      same_schema = false;
-      break;
-    }
-  }
-
-  // Declare layout variables for both cases
-  bool self_is_contiguous = true;
-  bool src_is_contiguous = true;
-  bool self_is_channels_last = false;
-  bool src_is_channels_last = false;
-
-  // For same schema, we don't need to check memory formats - just use direct
-  // copy
-  if (!same_schema) {
-    // Different strides: check memory format and only support contiguous <->
-    // channels-last conversion
-
-    // Check if contiguous (strides decrease from left to right)
-    self_is_contiguous =
-        is_tensor_contiguous(self->dim(), self_sizes, self_strides);
-
-    src_is_contiguous =
-        is_tensor_contiguous(src->dim(), src_sizes, src_strides);
-
-    // Check if channels-last (4D: NHWC format)
-    if (!self_is_contiguous) {
-      self_is_channels_last =
-          is_tensor_channels_last(self->dim(), self_sizes, self_strides);
-    }
-
-    if (!src_is_contiguous) {
-      src_is_channels_last =
-          is_tensor_channels_last(src->dim(), src_sizes, src_strides);
-    }
-
-    // Validate layout assumptions only when schemas differ
-    if (!self_is_contiguous && !self_is_channels_last) {
-      ET_LOG(
-          Error,
-          "self tensor must be contiguous or channels-last for stride conversion");
-      et_error_log_array_values(self_strides, self->dim(), "self strides");
-      et_error_log_array_values(self_sizes, self->dim(), "self_sizes");
-      return Error::InvalidArgument;
-    }
-
-    if (!src_is_contiguous && !src_is_channels_last) {
-      ET_LOG(
-          Error,
-          "src tensor must be contiguous or channels-last for stride conversion");
-      et_error_log_array_values(src_strides, src->dim(), "self strides");
-      et_error_log_array_values(src_sizes, src->dim(), "src_sizes");
-      return Error::InvalidArgument;
-    }
-  }
-
   // Determine device locations
   bool srcIsDevice = false;
   bool dstIsDevice = false;
@@ -563,161 +441,28 @@ AOTITorchError aoti_torch_copy_(
     dstIsDevice = metal_is_device_pointer(self->mutable_data_ptr());
   }
 
+  // Check if tensors have the same schema (sizes, strides, dtype) for fast path
+  // TODO: This should be improved to catch cases like (4, 1, 5) -> (4, 5)
+  bool same_schema = true;
+  for (int i = 0; i < self->dim(); i++) {
+    if (self_strides[i] != src_strides[i]) {
+      same_schema = false;
+      break;
+    }
+  }
+
   size_t total_bytes = src->nbytes();
+  int64_t total_elements = self->numel();
 
   if (same_schema) {
-    // Simple copy since layouts match
-    if (srcIsDevice && dstIsDevice) {
-      // For Metal, use the helper function for device-to-device copy
-      int result = metal_copy_memory(
-          self->mutable_data_ptr(),
-          src->data_ptr(),
-          total_bytes,
-          true,  // src is device
-          true); // dst is device
-      if (result != 0) {
-        ET_LOG(Error, "Failed to copy from Metal device to device");
-        return Error::Internal;
-      }
-    } else if (srcIsDevice && !dstIsDevice) {
-      // For Metal, use the helper function for device-to-host copy
-      int result = metal_copy_memory(
-          self->mutable_data_ptr(),
-          src->data_ptr(),
-          total_bytes,
-          true,   // src is device
-          false); // dst is host
-      if (result != 0) {
-        ET_LOG(Error, "Failed to copy from Metal device to host");
-        return Error::Internal;
-      }
-    } else if (!srcIsDevice && dstIsDevice) {
-      // For Metal, use the helper function for host-to-device copy
-      int result = metal_copy_memory(
-          self->mutable_data_ptr(),
-          src->data_ptr(),
-          total_bytes,
-          false, // src is host
-          true); // dst is device
-      if (result != 0) {
-        ET_LOG(Error, "Failed to copy from host to Metal device");
-        return Error::Internal;
-      }
-    } else {
-      std::memcpy(self->mutable_data_ptr(), src->data_ptr(), total_bytes);
+    int result = metal_copy_memory(self->mutable_data_ptr(), src->data_ptr(), total_bytes, srcIsDevice, dstIsDevice);
+    if (result != 0) {
+      ET_LOG(Error, "metal_copy_memory failed with status %d", result);
+      return Error::Internal;
     }
   } else {
-    // Layout conversion needed (contiguous <-> channels-last)
-
-    if (self->dim() != 4) {
-      ET_LOG(Error, "Layout conversion only supported for 4D tensors");
-      return Error::NotImplemented;
-    }
-
-    // Get data to host for processing
-    size_t total_elements = total_bytes / sizeof(float);
-    float* src_host_data = nullptr;
-    float* dst_host_data = nullptr;
-    bool need_free_src = false;
-    bool need_free_dst = false;
-
-    if (srcIsDevice) {
-      src_host_data = new float[total_elements];
-      int result = metal_copy_memory(
-          src_host_data,
-          src->data_ptr(),
-          total_bytes,
-          true,   // src is device
-          false); // dst is host
-      if (result != 0) {
-        ET_LOG(Error, "Failed to copy src from Metal device to host");
-        delete[] src_host_data;
-        return Error::Internal;
-      }
-      need_free_src = true;
-    } else {
-      src_host_data = static_cast<float*>(const_cast<void*>(src->data_ptr()));
-    }
-
-    if (dstIsDevice) {
-      dst_host_data = new float[total_elements];
-      need_free_dst = true;
-    } else {
-      dst_host_data = static_cast<float*>(self->mutable_data_ptr());
-    }
-
-    // Perform layout conversion (4D NCHW <-> NHWC)
-    int64_t N = self_sizes[0], C = self_sizes[1], H = self_sizes[2],
-            W = self_sizes[3];
-
-    for (int64_t n = 0; n < N; n++) {
-      for (int64_t c = 0; c < C; c++) {
-        for (int64_t h = 0; h < H; h++) {
-          for (int64_t w = 0; w < W; w++) {
-            size_t src_offset, dst_offset;
-
-            if (src_is_contiguous) {
-              // Source is NCHW
-              src_offset = n * C * H * W + c * H * W + h * W + w;
-            } else {
-              // Source is NHWC
-              src_offset = n * H * W * C + h * W * C + w * C + c;
-            }
-
-            if (self_is_contiguous) {
-              // Destination is NCHW
-              dst_offset = n * C * H * W + c * H * W + h * W + w;
-            } else {
-              // Destination is NHWC
-              dst_offset = n * H * W * C + h * W * C + w * C + c;
-            }
-
-            dst_host_data[dst_offset] = src_host_data[src_offset];
-          }
-        }
-      }
-    }
-
-    // Copy result back to device if needed
-    if (dstIsDevice) {
-      int result = metal_copy_memory(
-          self->mutable_data_ptr(),
-          dst_host_data,
-          total_bytes,
-          false, // src is host
-          true); // dst is device
-      if (result != 0) {
-        ET_LOG(Error, "Failed to copy result to Metal device");
-        // Clean up temporary buffers before returning
-        if (need_free_src)
-          delete[] src_host_data;
-        if (need_free_dst)
-          delete[] dst_host_data;
-        return Error::Internal;
-      }
-    }
-
-    // Clean up temporary buffers
-    if (need_free_src)
-      delete[] src_host_data;
-    if (need_free_dst)
-      delete[] dst_host_data;
-  }
-
-  // Verify the copy by checking first element
-  float src_first, dst_first;
-  if (srcIsDevice) {
-    // For Metal, we can directly access since it uses shared memory
-    src_first = static_cast<const float*>(src->data_ptr())[0];
-  } else {
-    src_first = static_cast<const float*>(src->data_ptr())[0];
-  }
-
-  if (dstIsDevice) {
-    // For Metal, we can directly access since it uses shared memory
-    dst_first = static_cast<const float*>(self->data_ptr())[0];
-  } else {
-    dst_first = static_cast<const float*>(self->data_ptr())[0];
+    ET_LOG(Error, "Layout conversion not supported");
+    return Error::NotImplemented;
   }
 
   return Error::Ok;
