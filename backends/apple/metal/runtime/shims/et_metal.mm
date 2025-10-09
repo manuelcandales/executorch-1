@@ -108,17 +108,47 @@ int metal_copy_memory(void* dst, const void* src, size_t nbytes, bool src_is_dev
     }
 
     @autoreleasepool {
+        // Case 1: Device-to-device copy - use GPU blit encoder (most efficient)
+        if (src_is_device && dst_is_device) {
+            auto src_it = ptr_to_mtl_buffer.find(const_cast<void*>(src));
+            auto dst_it = ptr_to_mtl_buffer.find(dst);
+            
+            if (src_it != ptr_to_mtl_buffer.end() && dst_it != ptr_to_mtl_buffer.end()) {
+                id<MTLBuffer> srcBuffer = src_it->second;
+                id<MTLBuffer> dstBuffer = dst_it->second;
+                
+                // Calculate offsets relative to buffer base
+                size_t srcOffset = static_cast<const uint8_t*>(src) - static_cast<const uint8_t*>([srcBuffer contents]);
+                size_t dstOffset = static_cast<uint8_t*>(dst) - static_cast<uint8_t*>([dstBuffer contents]);
+                
+                // Use Metal's blit encoder for GPU-accelerated copy
+                ETMetalStream* stream = getCurrentMetalStream();
+                stream->copy(srcBuffer, dstBuffer, nbytes, srcOffset, dstOffset, SyncType::NONE);
+                
+                ET_LOG(Debug, "Metal device-to-device copy (GPU blit): %zu bytes", nbytes);
+                return 0;
+            }
+            
+            ET_LOG(Error, "Metal copy: Device pointers not found in buffer map");
+            return -1;
+        }
+        
+        // Case 2: Host-to-device or device-to-host - use memcpy with shared memory
+        // Since Metal uses shared storage mode, CPU and GPU access the same memory
         std::memcpy(dst, src, nbytes);
-
-        // For shared memory buffers, synchronization is typically not needed
-        // since both CPU and GPU access the same memory space
-        if (src_is_device || dst_is_device) {
+        
+        // Synchronize only if we need to ensure GPU operations complete before CPU reads
+        // (device-to-host case where GPU may have written data)
+        if (src_is_device && !dst_is_device) {
+            // Ensure any pending GPU writes to source complete before CPU reads
             ETMetalStream* stream = getCurrentMetalStream();
             stream->synchronize(SyncType::COMMIT_AND_WAIT);
         }
+        
+        ET_LOG(Debug, "Metal memory copy (memcpy): %zu bytes, src_device=%d, dst_device=%d", 
+               nbytes, src_is_device, dst_is_device);
     }
 
-    ET_LOG(Debug, "Metal memory copy completed: %zu bytes", nbytes);
     return 0;
 }
 
