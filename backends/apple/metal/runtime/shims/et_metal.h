@@ -196,6 +196,12 @@ ETMetalStream* getCurrentMetalStream();
 void setCurrentMetalStream(ETMetalStream* stream);
 
 // =======================
+// Metal stream synchronization functions (C++ interface with exceptions)
+// =======================
+void synchronize_metal_stream();
+void synchronize_metal_stream_with_type(int sync_type);
+
+// =======================
 // Metal helper functions (C interface)
 // =======================
 #ifdef __cplusplus

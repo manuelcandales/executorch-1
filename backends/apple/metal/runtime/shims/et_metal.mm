@@ -813,6 +813,30 @@ void setCurrentMetalStream(ETMetalStream* stream) {
     currentStream_ = stream;
 }
 
+// =======================
+// Metal Stream Synchronization Functions
+// =======================
+
+void synchronize_metal_stream() {
+    @autoreleasepool {
+        // Use the ETMetalStream for proper synchronization
+        ETMetalStream* stream = getCurrentMetalStream();
+        stream->synchronize(SyncType::COMMIT_AND_WAIT);
+
+        ET_LOG(Debug, "synchronize_metal_stream: Stream synchronized with COMMIT_AND_WAIT");
+    }
+}
+
+void synchronize_metal_stream_with_type(int sync_type) {
+    @autoreleasepool {
+        ETMetalStream* stream = getCurrentMetalStream();
+        SyncType syncTypeEnum = static_cast<SyncType>(sync_type);
+        stream->synchronize(syncTypeEnum);
+
+        ET_LOG(Debug, "synchronize_metal_stream_with_type: Stream synchronized with SyncType %d", sync_type);
+    }
+}
+
 } // namespace metal
 } // namespace backends
 } // namespace executorch

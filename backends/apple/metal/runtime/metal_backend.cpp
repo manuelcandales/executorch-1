@@ -34,6 +34,7 @@
 #include "shims/tensor_attribute.h"
 #include "shims/utils.h"
 #include "shims/shim_mps.h"
+#include "shims/et_metal.h"
 
 namespace executorch {
 namespace backends {
@@ -403,9 +404,13 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
     }
 
     // Ensure all GPU work is completed before reading results
-    Error sync_err = aoti_torch_mps_synchronize_stream();
-    if (sync_err != Error::Ok) {
-      ET_LOG(Error, "Failed to synchronize Metal stream after kernel execution");
+    try {
+      synchronize_metal_stream();
+    } catch (const std::exception& e) {
+      ET_LOG(Error, "Failed to synchronize Metal stream after kernel execution: %s", e.what());
+      return Error::Internal;
+    } catch (...) {
+      ET_LOG(Error, "Failed to synchronize Metal stream after kernel execution: unknown exception");
       return Error::Internal;
     }
 

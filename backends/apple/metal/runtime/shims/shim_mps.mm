@@ -479,47 +479,6 @@ AOTITorchError aoti_torch_mps_copy_buffer(
     }
 }
 
-AOTITorchError aoti_torch_mps_synchronize_stream() {
-    @autoreleasepool {
-        try {
-            // Use the ETMetalStream for proper synchronization
-            ETMetalStream* stream = getCurrentMetalStream();
-            stream->synchronize(SyncType::COMMIT_AND_WAIT);
-
-            ET_LOG(Debug, "aoti_torch_mps_synchronize_stream: Stream synchronized with COMMIT_AND_WAIT");
-            return Error::Ok;
-
-        } catch (const std::exception& e) {
-            ET_LOG(Error, "aoti_torch_mps_synchronize_stream exception: %s", e.what());
-            return Error::Internal;
-        } catch (...) {
-            ET_LOG(Error, "aoti_torch_mps_synchronize_stream: unknown exception");
-            return Error::Internal;
-        }
-    }
-}
-
-// Synchronization function with SyncType options
-AOTITorchError aoti_torch_mps_synchronize_stream_with_type(int sync_type) {
-    @autoreleasepool {
-        try {
-            ETMetalStream* stream = getCurrentMetalStream();
-            SyncType syncTypeEnum = static_cast<SyncType>(sync_type);
-            stream->synchronize(syncTypeEnum);
-
-            ET_LOG(Debug, "aoti_torch_mps_synchronize_stream_with_type: Stream synchronized with SyncType %d", sync_type);
-            return Error::Ok;
-
-        } catch (const std::exception& e) {
-            ET_LOG(Error, "aoti_torch_mps_synchronize_stream_with_type exception: %s", e.what());
-            return Error::Internal;
-        } catch (...) {
-            ET_LOG(Error, "aoti_torch_mps_synchronize_stream_with_type: unknown exception");
-            return Error::Internal;
-        }
-    }
-}
-
 // Shared callback function for std::function trampoline
 void aoti_torch_mps_shared_callback(
     AOTIMetalKernelFunctionHandle func,

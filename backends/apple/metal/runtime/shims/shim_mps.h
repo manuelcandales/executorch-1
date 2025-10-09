@@ -14,7 +14,6 @@ namespace executorch {
 namespace backends {
 namespace metal {
 
-// Forward declarations to match PyTorch's AOTI MPS interface
 struct AOTIMetalKernelFunctionOpaque;
 using AOTIMetalKernelFunctionHandle = AOTIMetalKernelFunctionOpaque*;
 
@@ -39,7 +38,7 @@ AOTITorchError aoti_torch_mps_get_kernel_function(
     const char* kernel_name,
     AOTIMetalKernelFunctionHandle* function_handle);
 
-// MetalKernelFunction functions - individual call versions
+// MetalKernelFunction functions
 AOTITorchError aoti_torch_mps_start_encoding(
     AOTIMetalKernelFunctionHandle func);
 
@@ -94,9 +93,6 @@ AOTITorchError aoti_torch_mps_copy_buffer(
     size_t data_size,
     size_t src_offset,
     size_t dst_offset);
-// Stream management with flexible synchronization
-AOTITorchError aoti_torch_mps_synchronize_stream();
-AOTITorchError aoti_torch_mps_synchronize_stream_with_type(int sync_type);
 
 // C callback function type for command block execution
 typedef void (*aoti_torch_mps_command_block_callback_t)(
