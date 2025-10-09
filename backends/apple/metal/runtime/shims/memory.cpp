@@ -373,36 +373,52 @@ AOTITorchError aoti_torch_delete_tensor_object(AOTITensorHandle tensor) {
   return Error::InvalidArgument;
 }
 
-AOTITorchError aoti_torch_copy_(
+AOTITorchError aoti_torch_copy_( 
     AOTITensorHandle self,
     AOTITensorHandle src,
     int32_t non_blocking) {
-  // assert same dim for now
-  if (self->dim() != src->dim()) {
-    ET_LOG(
-        Error,
-        "dimension mismatch. self.dim()=%zd, src.dim()=%zd",
-        self->dim(),
-        src->dim());
-    return Error::InvalidArgument;
-  }
+  (void)non_blocking;
 
-  // only support float32 for now
+  // Check for null pointers first
+  ET_CHECK_OR_RETURN_ERROR(
+      self != nullptr,
+      InvalidArgument,
+      "aoti_torch_copy_ failed: self tensor is null");
+
+  ET_CHECK_OR_RETURN_ERROR(
+      src != nullptr,
+      InvalidArgument,
+      "aoti_torch_copy_ failed: src tensor is null");
+
+  // Get dtype information and validate compatibility
   int32_t self_dtype, src_dtype;
   aoti_torch_get_dtype(self, &self_dtype);
   aoti_torch_get_dtype(src, &src_dtype);
 
-  AOTITorchError self_dtype_error = validate_dtype(self_dtype);
-  if (self_dtype_error != Error::Ok) {
-    return self_dtype_error;
-  }
+  ET_CHECK_OK_OR_RETURN_ERROR(validate_dtype(self_dtype));
 
-  AOTITorchError src_dtype_error = validate_dtype(src_dtype);
-  if (src_dtype_error != Error::Ok) {
-    return src_dtype_error;
-  }
+  ET_CHECK_OK_OR_RETURN_ERROR(validate_dtype(src_dtype));
 
-  // Get stride information for layout/contiguity validation
+  // Check dtype compatibility - both tensors must have the same dtype
+  ET_CHECK_OR_RETURN_ERROR(
+      self_dtype == src_dtype,
+      InvalidArgument,
+      "dtype mismatch. self.dtype=%d, src.dtype=%d. aoti_torch_copy_ requires same dtypes",
+      self_dtype,
+      src_dtype);
+
+  // Check total number of elements compatibility (PyTorch copy_ behavior)
+  int64_t self_numel = self->numel();
+  int64_t src_numel = src->numel();
+
+  ET_CHECK_OR_RETURN_ERROR(
+      self_numel == src_numel,
+      InvalidArgument,
+      "numel mismatch. self.numel()=%ld, src.numel()=%ld",
+      self_numel,
+      src_numel);
+
+  // Get tensor metadata
   int64_t* self_strides;
   int64_t* src_strides;
   aoti_torch_get_strides(self, &self_strides);
