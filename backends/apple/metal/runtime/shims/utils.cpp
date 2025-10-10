@@ -16,11 +16,6 @@ namespace metal {
 
 extern "C" {
 
-// Function to cleanup the tensor output file (to be called from metal_backend.cpp)
-void cleanup_aoti_tensor_output() {
-  // No cleanup needed since file is opened and closed on each call
-}
-
 // Helper function to check if a dtype is supported in Metal backend
 bool is_dtype_supported_in_et_metal(int32_t dtype) {
   switch (dtype) {
@@ -50,6 +45,48 @@ AOTITorchError validate_dtype(int32_t dtype) {
 }
 
 } // extern "C"
+
+// Utility function to convert sizes pointer to vector
+std::vector<executorch::aten::SizesType> convert_sizes_to_vector(
+    int64_t ndim,
+    const int64_t* sizes_ptr) {
+  std::vector<executorch::aten::SizesType> sizes(ndim);
+  for (int i = 0; i < ndim; i++) {
+    sizes[i] = static_cast<executorch::aten::SizesType>(sizes_ptr[i]);
+  }
+  return sizes;
+}
+
+// Utility function to convert strides pointer to vector or calculate from sizes
+std::vector<executorch::aten::StridesType> convert_strides_to_vector(
+    int64_t ndim,
+    const int64_t* sizes_ptr,
+    const int64_t* strides_ptr) {
+  std::vector<executorch::aten::StridesType> strides(ndim);
+
+  if (strides_ptr != nullptr) {
+    // Use provided strides. it is ok if provided strides here is not contiguous
+    // strides since it will be used internally in CUDA delegate.
+    for (int64_t i = 0; i < ndim; i++) {
+      strides[i] = static_cast<executorch::aten::StridesType>(strides_ptr[i]);
+    }
+  } else {
+    // Calculate strides from sizes using ExecutorTorch's algorithm
+    if (ndim > 0) {
+      strides[ndim - 1] = static_cast<executorch::aten::StridesType>(
+          1); // Last dimension has stride 1
+      for (int64_t i = ndim - 2; i >= 0; i--) {
+        if (sizes_ptr[i + 1] == 0) {
+          strides[i] = strides[i + 1]; // Copy stride when size is 0
+        } else {
+          strides[i] = static_cast<executorch::aten::StridesType>(
+              static_cast<int64_t>(strides[i + 1]) * sizes_ptr[i + 1]);
+        }
+      }
+    }
+  }
+  return strides;
+}
 
 } // namespace metal
 } // namespace backends

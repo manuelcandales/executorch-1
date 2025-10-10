@@ -36,13 +36,38 @@ extern "C" {
 // Helper function to check if a dtype is supported in Metal backend
 bool is_dtype_supported_in_et_metal(int32_t dtype);
 
-// Cleanup function for tensor output file (called during backend destruction)
-void cleanup_aoti_tensor_output();
-
 // Metal-specific dtype validation utility function
 AOTITorchError validate_dtype(int32_t dtype);
 
 } // extern "C"
+
+// Utility function to convert sizes pointer to vector
+std::vector<executorch::aten::SizesType> convert_sizes_to_vector(
+    int64_t ndim,
+    const int64_t* sizes_ptr);
+
+// Utility function to convert strides pointer to vector or calculate from sizes
+std::vector<executorch::aten::StridesType> convert_strides_to_vector(
+    int64_t ndim,
+    const int64_t* sizes_ptr,
+    const int64_t* strides_ptr);
+
+// Check if tensor is in contiguous memory format (NCHW for 4D tensors)
+// Contiguous format means strides decrease from left to right:
+// For NCHW: strides = [C*H*W, H*W, W, 1]
+inline bool is_contiguous_tensor (
+    std::vector<executorch::aten::SizesType> sizes,
+    std::vector<executorch::aten::StridesType> strides) {
+  int64_t ndim = static_cast<int64_t>(strides.size());
+  int64_t expected_stride = 1;
+  for (int64_t i = ndim - 1; i >= 0; i--) {
+    if (strides[i] != expected_stride) {
+      return false;
+    }
+    expected_stride *= sizes[i];
+  }
+  return true;
+}
 
 } // namespace metal
 } // namespace backends

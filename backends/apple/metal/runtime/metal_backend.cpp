@@ -467,7 +467,6 @@ class MetalBackend final : public ::executorch::runtime::BackendInterface {
     free(handle);
     cleanup_memory();
     executorch::backends::aoti::cleanup_tensor_metadata();
-    cleanup_aoti_tensor_output();
     ET_LOG(Debug, "MetalBackend handle %p destroy", handle_);
   }
 };
