@@ -34,30 +34,6 @@ using namespace executorch::backends::aoti;
 
 namespace { // Internal namespace for utility functions
 
-// Utility function to log array values as error msg in format [val1, val2, ...]
-// For use with pointer-based arrays (e.g., int64_t* strides, int64_t* sizes)
-void et_error_log_array_values(
-    const int64_t* values,
-    int64_t count,
-    const std::string& name = "values") {
-  if (count <= 0) {
-    ET_LOG(Error, "%s: empty array", name.c_str());
-    return;
-  }
-
-  // Build array string representation
-  std::string array_str = "[";
-  for (int64_t i = 0; i < count; i++) {
-    array_str += std::to_string(values[i]);
-    if (i < count - 1) {
-      array_str += ", ";
-    }
-  }
-  array_str += "]";
-
-  ET_LOG(Error, "%s: %s", name.c_str(), array_str.c_str());
-}
-
 // Check if tensor is in contiguous memory format (NCHW for 4D tensors)
 // Contiguous format means strides decrease from left to right:
 // For NCHW: strides = [C*H*W, H*W, W, 1]
@@ -260,16 +236,14 @@ AOTITorchError aoti_torch_empty_strided(
     numel *= sizes_ptr[i];
   }
 
-  AOTITorchError dtype_error = validate_dtype(dtype);
-  if (dtype_error != Error::Ok) {
-    return dtype_error;
-  }
+  ET_CHECK_OK_OR_RETURN_ERROR(validate_dtype(dtype));
 
   size_t element_size = dtype_to_element_size(dtype);
-  if (element_size == 0) {
-    ET_LOG(Error, "Invalid element size for dtype: %d", dtype);
-    return Error::InvalidArgument;
-  }
+  ET_CHECK_OR_RETURN_ERROR(
+      element_size != 0,
+      InvalidArgument,
+      "Invalid element size for dtype: %d",
+      dtype);
   int64_t nbytes = numel * element_size;
 
   if (device_type == 2) { // Metal/MPS
@@ -281,21 +255,21 @@ AOTITorchError aoti_torch_empty_strided(
   } else if (device_type == 0) { // cpu
     // Ensure 16-byte alignment for CPU memory to match device requirements
     int result = posix_memalign(&ptr, 16, nbytes);
-    if (result != 0) {
-      ET_LOG(Error, "Failed to allocate aligned CPU memory");
-      return Error::MemoryAllocationFailed;
-    }
-    if (ptr == nullptr) {
-      ET_LOG(Error, "Failed to call posix_memalign");
-      return Error::MemoryAllocationFailed;
-    }
+    ET_CHECK_OR_RETURN_ERROR(
+        result == 0,
+        MemoryAllocationFailed,
+        "Failed to allocate aligned CPU memory");
+    ET_CHECK_OR_RETURN_ERROR(
+        ptr != nullptr,
+        MemoryAllocationFailed,
+        "Failed to call posix_memalign");
     ET_LOG(Debug, "Allocated %lld bytes on CPU", nbytes);
   } else {
-    ET_LOG(
-        Error,
-        "Unsupported device type %d",
-        device_type);
-    return Error::NotImplemented;
+    ET_CHECK_OR_RETURN_ERROR(
+      false,
+      NotImplemented,
+      "Need to implement empty_strided for non-CUDA non-CPU device type %d",
+      device_type);
   }
 
   // ETensor sizes
