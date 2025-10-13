@@ -104,6 +104,14 @@ if(TORCH_OMP_LIBRARY AND TORCH_OMP_LIB_DIR)
 endif()
 
 executorch_target_link_options_shared_lib(metal_backend)
+
+# Add runtime
+add_executable(voxtral_runner tests/voxtral_runner.cpp)
+target_link_libraries(
+  voxtral_runner PUBLIC metal_backend extension_module_static extension_flat_tensor
+                        portable_ops_lib
+)
+
 install(
   TARGETS metal_backend
   EXPORT ExecuTorchTargets
