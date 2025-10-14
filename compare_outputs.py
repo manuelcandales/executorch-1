@@ -64,11 +64,15 @@ def calculate_tolerances(runtime_outputs, label_outputs):
     return max_atol, max_rtol
 
 
-def main():
+def main(name):
     """Main function to compare outputs and print tolerances."""
     # File paths
-    runtime_file = "aoti_debug_data/final_runtime_output.txt"
-    label_file = "aoti_debug_data/label_output.txt"
+    if name is not None:
+        runtime_file = f"aoti_debug_data/{name}_final_runtime_output.txt"
+        label_file = f"aoti_debug_data/{name}_label_output.txt"
+    else:
+        runtime_file = "aoti_debug_data/final_runtime_output.txt"
+        label_file = "aoti_debug_data/label_output.txt"
 
     print("=" * 60)
     print("AOTI Runtime vs Label Output Comparison")
@@ -151,4 +155,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Compare runtime and label outputs.")
+    parser.add_argument("name", nargs="?", default=None, help="Optional name for this comparison run")
+    args = parser.parse_args()
+
+    if args.name is not None:
+        print(f"Comparison name: {args.name}")
+
+    main(args.name)

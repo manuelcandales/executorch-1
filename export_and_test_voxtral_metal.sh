@@ -156,6 +156,6 @@ export VOXTRAL_DIR=/Users/mcandales/github/metal_delegate/voxtral
       --model_path $VOXTRAL_DIR/model.pte \
       --data_path $VOXTRAL_DIR/aoti_metal_blob.ptd \
       --tokenizer_path $VOXTRAL_DIR/tekken.json \
-      --audio_path $VOXTRAL_DIR/poem.wav \
+      --audio_path $VOXTRAL_DIR/call_samantha_hall.wav \
       --processor_path $VOXTRAL_DIR/voxtral_preprocessor.pte \
       --temperature 0

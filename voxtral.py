@@ -15,13 +15,13 @@ from executorch.exir import to_edge_transform_and_lower
 logging.basicConfig(level=logging.DEBUG)
 
 
-def load_and_export(model_id, device):
+def load_and_export(model_id, device, dtype):
     module = load_multimodal_text_to_text_model(
         model_id,
         device=device,
         use_custom_sdpa=False,
         use_custom_kv_cache=False,
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
 
     ep = module.export()
@@ -75,40 +75,53 @@ def executorch_metal_lowering(ep, name):
         f"Export completed successfully! PTE saved to {output_pte_path} and ptd saved to {output_data_dir}"
     )
 
-def compile_ep(name, ep_, device):
+def compile_ep(name, ep_, device, dtype):
     print(f"AOTI Compiling {name}")
 
     path = torch._inductor.aoti_compile_and_package(
         ep_,
-        package_path=f"aoti_{name}_{device}.pt2",
+        package_path=f"aoti_{name}_{device}_{dtype}.pt2",
     )
 
-def export_model(model_id, device):
-    ep = load_and_export(model_id, device)
-    for name, ep_ in ep.items():
-        compile_ep(name, ep_, device)
+def dump_label_to_file(label_output, name):
+    # Dump label to file
+    with open(f"aoti_debug_data/{name}_label_output.txt", "w") as f:
+        if isinstance(label_output, tuple):
+            # Multiple outputs
+            all_elements = []
+            for tensor in label_output:
+                if tensor.numel() > 0:
+                    all_elements.extend(tensor.flatten().tolist())
+            f.write(",".join(map(str, all_elements)))
+        else:
+            # Single output
+            if label_output.numel() > 0:
+                f.write(",".join(map(str, label_output.flatten().tolist())))
 
-def main_executorch(device, mode, name):
+def main_executorch(device, mode, name, dtype):
     model_id = "mistralai/Voxtral-Mini-3B-2507"
     config = AutoConfig.from_pretrained(model_id)
 
     if mode == "export":
-        ep = load_and_export(model_id, device)
+        ep = load_and_export(model_id, device, dtype)
         executorch_metal_lowering(ep, name)
         return
 
-def main_torch(device, mode):
+def main_torch(device, mode, dtype):
     model_id = "mistralai/Voxtral-Mini-3B-2507"
     config = AutoConfig.from_pretrained(model_id)
 
     if mode == "export":
-        export_model(model_id, device)
+        ep = load_and_export(model_id, device, dtype)
+        for name, ep_ in ep.items():
+            compile_ep(name, ep_, device, dtype)
         return
 
+    print(f"Loading {model_id} {device} {dtype} ...")
     ep = {
-        "token_embedding": torch._inductor.aoti_load_package("aoti_token_embedding_mps.pt2"),
-        "audio_encoder": torch._inductor.aoti_load_package("aoti_audio_encoder_mps.pt2"),
-        "text_decoder": torch._inductor.aoti_load_package("aoti_text_decoder_mps.pt2"),
+        "token_embedding": torch._inductor.aoti_load_package(f"aoti_token_embedding_{device}_{dtype}.pt2"),
+        "audio_encoder": torch._inductor.aoti_load_package(f"aoti_audio_encoder_{device}_{dtype}.pt2"),
+        "text_decoder": torch._inductor.aoti_load_package(f"aoti_text_decoder_{device}_{dtype}.pt2"),
     }
 
     # Generate
@@ -131,6 +144,28 @@ def main_torch(device, mode):
 
     for name in inputs:
         inputs[name] = inputs[name].to(device)
+        if inputs[name].dtype == torch.float32 and dtype == torch.bfloat16:
+            inputs[name] = inputs[name].to(dtype)
+        print(f"{name}: {inputs[name].shape}, {inputs[name].dtype}")
+
+    # sample_input_ids = torch.ones([1, 2047], dtype=torch.long, device=device)
+    # sample_token_embedding_output = ep["token_embedding"](sample_input_ids)
+    # dump_label_to_file(sample_token_embedding_output, "token_embedding")
+    # print("token_embedding output:", sample_token_embedding_output.shape, sample_token_embedding_output.dtype)
+
+    sample_input_features = torch.ones([10, 128, 3000], dtype=dtype, device=device)
+    sample_audio_encoder_output = ep["audio_encoder"](input_features=sample_input_features)
+    dump_label_to_file(sample_audio_encoder_output, "audio_encoder")
+    print("audio_encoder output:", sample_audio_encoder_output.shape, sample_audio_encoder_output.dtype)
+
+    # sample_token_embeddings = torch.ones([1, 2047, 3072], dtype=dtype, device=device)
+    # sample_cache_position = torch.ones([2047], dtype=torch.long, device=device)
+    # sample_text_decoder_output = ep["text_decoder"](inputs_embeds=sample_token_embeddings, cache_position=sample_cache_position)
+    # dump_label_to_file(sample_text_decoder_output, "text_decoder")
+    # print("text_decoder output:", sample_text_decoder_output.shape, sample_text_decoder_output.dtype)
+
+    import sys
+    sys.exit()
 
     input_ids = inputs["input_ids"]
     print("Producing token embeddings with exported program ...")
@@ -187,6 +222,12 @@ if __name__ == "__main__":
         help="Device to run the model on (e.g., 'cpu', 'cuda', 'mps').",
     )
     parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["torch", "executorch"],
+        help="Backend to run the model on (e.g., 'torch', 'executorch').",
+    )
+    parser.add_argument(
         "--mode",
         type=str,
         choices=["export", "run"],
@@ -198,6 +239,21 @@ if __name__ == "__main__":
         choices=["token_embedding", "audio_encoder", "text_decoder"],
         help="Component to export and run",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=["float32", "bfloat16"],
+        help="Component to export and run",
+    )
     args = parser.parse_args()
 
-    main_executorch(args.device, args.mode, args.name)
+    dtype = torch.float32
+    if args.dtype == "bfloat16":
+        dtype = torch.bfloat16
+
+    if args.backend == "torch":
+        main_torch(args.device, args.mode, dtype)
+    elif args.backend == "executorch":
+        main_executorch(args.device, args.mode, args.name, dtype)
+    else:
+        raise ValueError(f"Unknown backend: {args.backend}")
