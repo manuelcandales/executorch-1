@@ -1017,6 +1017,109 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: batchSize=%lld, num_heads=%lld, qSize=%lld, headSize=%lld, kvSeqLength=%lld",
                batchSize, num_heads, qSize, headSize, kvSeqLength);
 
+        // Detect non-contiguous layouts for query, key, and value tensors
+        // For a 4D tensor [batch, num_heads, seq_len, head_dim], common non-contiguous patterns:
+        // - Transposed last 2 dims (dims 2,3): strides[2] == 1 && strides[3] == seq_len (seq_len and head_dim swapped)
+        // - Transposed internal dims (dims 1,2): strides[1] == head_dim && strides[2] == num_heads*head_dim (num_heads and seq_len swapped)
+        // - Other permutations may exist depending on upstream operations
+        
+        bool query_is_transposed_last2 = false;   // transpose of dims -2 and -1
+        bool query_is_transposed_internal = false; // transpose of dims 1 and 2
+        bool key_is_transposed_last2 = false;
+        bool key_is_transposed_internal = false;
+        bool value_is_transposed_last2 = false;
+        bool value_is_transposed_internal = false;
+        
+        // Expected contiguous strides for query [batch, num_heads, qSize, headSize]
+        int64_t expected_q_stride_3 = 1;
+        int64_t expected_q_stride_2 = headSize;
+        int64_t expected_q_stride_1 = qSize * headSize;
+        int64_t expected_q_stride_0 = num_heads * qSize * headSize;
+        
+        // Check query tensor layout
+        auto q_strides = query_tensor->strides();
+        if (q_strides[3] != expected_q_stride_3 || q_strides[2] != expected_q_stride_2 || 
+            q_strides[1] != expected_q_stride_1) {
+          // Check if it's a transpose of the last two dimensions (dims 2 and 3)
+          if (q_strides[2] == 1 && q_strides[3] == qSize && q_strides[1] == qSize * headSize) {
+            query_is_transposed_last2 = true;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query tensor has transposed last 2 dims (dims 2,3) (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)q_strides[0], (int64_t)q_strides[1], (int64_t)q_strides[2], (int64_t)q_strides[3]);
+          }
+          // Check if it's a transpose of the internal dimensions (dims 1 and 2)
+          else if (q_strides[1] == headSize && q_strides[2] == num_heads * headSize && q_strides[3] == 1) {
+            query_is_transposed_internal = true;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query tensor has transposed internal dims (dims 1,2) (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)q_strides[0], (int64_t)q_strides[1], (int64_t)q_strides[2], (int64_t)q_strides[3]);
+          } else {
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query tensor is non-contiguous with unusual layout (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)q_strides[0], (int64_t)q_strides[1], (int64_t)q_strides[2], (int64_t)q_strides[3]);
+          }
+        } else {
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query tensor is contiguous (strides=[%lld,%lld,%lld,%lld])",
+                 (int64_t)q_strides[0], (int64_t)q_strides[1], (int64_t)q_strides[2], (int64_t)q_strides[3]);
+        }
+        
+        // Expected contiguous strides for key [batch, num_heads, kvSeqLength, headSize]
+        int64_t expected_k_stride_3 = 1;
+        int64_t expected_k_stride_2 = headSize;
+        int64_t expected_k_stride_1 = kvSeqLength * headSize;
+        int64_t expected_k_stride_0 = num_heads * kvSeqLength * headSize;
+        
+        // Check key tensor layout
+        auto k_strides = key_tensor->strides();
+        if (k_strides[3] != expected_k_stride_3 || k_strides[2] != expected_k_stride_2 || 
+            k_strides[1] != expected_k_stride_1) {
+          // Check if it's a transpose of the last two dimensions (dims 2 and 3)
+          if (k_strides[2] == 1 && k_strides[3] == kvSeqLength && k_strides[1] == kvSeqLength * headSize) {
+            key_is_transposed_last2 = true;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key tensor has transposed last 2 dims (dims 2,3) (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)k_strides[0], (int64_t)k_strides[1], (int64_t)k_strides[2], (int64_t)k_strides[3]);
+          }
+          // Check if it's a transpose of the internal dimensions (dims 1 and 2)
+          else if (k_strides[1] == headSize && k_strides[2] == num_heads * headSize && k_strides[3] == 1) {
+            key_is_transposed_internal = true;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key tensor has transposed internal dims (dims 1,2) (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)k_strides[0], (int64_t)k_strides[1], (int64_t)k_strides[2], (int64_t)k_strides[3]);
+          } else {
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key tensor is non-contiguous with unusual layout (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)k_strides[0], (int64_t)k_strides[1], (int64_t)k_strides[2], (int64_t)k_strides[3]);
+          }
+        } else {
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key tensor is contiguous (strides=[%lld,%lld,%lld,%lld])",
+                 (int64_t)k_strides[0], (int64_t)k_strides[1], (int64_t)k_strides[2], (int64_t)k_strides[3]);
+        }
+        
+        // Expected contiguous strides for value [batch, num_heads, kvSeqLength, headSize]
+        int64_t expected_v_stride_3 = 1;
+        int64_t expected_v_stride_2 = headSize;
+        int64_t expected_v_stride_1 = kvSeqLength * headSize;
+        int64_t expected_v_stride_0 = num_heads * kvSeqLength * headSize;
+        
+        // Check value tensor layout
+        auto v_strides = value_tensor->strides();
+        if (v_strides[3] != expected_v_stride_3 || v_strides[2] != expected_v_stride_2 || 
+            v_strides[1] != expected_v_stride_1) {
+          // Check if it's a transpose of the last two dimensions (dims 2 and 3)
+          if (v_strides[2] == 1 && v_strides[3] == kvSeqLength && v_strides[1] == kvSeqLength * headSize) {
+            value_is_transposed_last2 = true;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value tensor has transposed last 2 dims (dims 2,3) (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)v_strides[0], (int64_t)v_strides[1], (int64_t)v_strides[2], (int64_t)v_strides[3]);
+          }
+          // Check if it's a transpose of the internal dimensions (dims 1 and 2)
+          else if (v_strides[1] == headSize && v_strides[2] == num_heads * headSize && v_strides[3] == 1) {
+            value_is_transposed_internal = true;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value tensor has transposed internal dims (dims 1,2) (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)v_strides[0], (int64_t)v_strides[1], (int64_t)v_strides[2], (int64_t)v_strides[3]);
+          } else {
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value tensor is non-contiguous with unusual layout (strides=[%lld,%lld,%lld,%lld])",
+                   (int64_t)v_strides[0], (int64_t)v_strides[1], (int64_t)v_strides[2], (int64_t)v_strides[3]);
+          }
+        } else {
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value tensor is contiguous (strides=[%lld,%lld,%lld,%lld])",
+                 (int64_t)v_strides[0], (int64_t)v_strides[1], (int64_t)v_strides[2], (int64_t)v_strides[3]);
+        }
+
         // Determine data type and element size
         int32_t dtype = static_cast<int32_t>(query_tensor->scalar_type());
         MPSDataType mps_dtype;
@@ -1176,31 +1279,145 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           MPSGraph* mpsGraph = [MPSGraph new];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created MPSGraph instance");
 
-          // Define tensor shapes for placeholders
-          NSArray<NSNumber*>* queryShape = @[@(batchSize), @(num_heads), @(qSize), @(headSize)];
-          NSArray<NSNumber*>* keyShape = @[@(batchSize), @(num_heads), @(kvSeqLength), @(headSize)];
-          NSArray<NSNumber*>* valueShape = @[@(batchSize), @(num_heads), @(kvSeqLength), @(headSize)];
+          // Define physical tensor shapes for placeholders (matching actual memory layout)
+          // Two transpose patterns supported:
+          // 1. Last 2 dims transposed (dims 2,3): [batch, num_heads, head_dim, seq_len]
+          // 2. Internal dims transposed (dims 1,2): [batch, seq_len, num_heads, head_dim]
+          NSArray<NSNumber*>* queryPhysicalShape;
+          NSArray<NSNumber*>* keyPhysicalShape;
+          NSArray<NSNumber*>* valuePhysicalShape;
+          
+          if (query_is_transposed_last2) {
+            // Physical layout: [batch, num_heads, headSize, qSize] (dims 2,3 swapped)
+            queryPhysicalShape = @[@(batchSize), @(num_heads), @(headSize), @(qSize)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query physical shape (transposed dims 2,3): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)num_heads, (int)headSize, (int)qSize);
+          } else if (query_is_transposed_internal) {
+            // Physical layout: [batch, qSize, num_heads, headSize] (dims 1,2 swapped)
+            queryPhysicalShape = @[@(batchSize), @(qSize), @(num_heads), @(headSize)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query physical shape (transposed dims 1,2): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)qSize, (int)num_heads, (int)headSize);
+          } else {
+            // Physical layout matches logical layout: [batch, num_heads, qSize, headSize]
+            queryPhysicalShape = @[@(batchSize), @(num_heads), @(qSize), @(headSize)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query physical shape (contiguous): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)num_heads, (int)qSize, (int)headSize);
+          }
+          
+          if (key_is_transposed_last2) {
+            // Physical layout: [batch, num_heads, headSize, kvSeqLength] (dims 2,3 swapped)
+            keyPhysicalShape = @[@(batchSize), @(num_heads), @(headSize), @(kvSeqLength)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key physical shape (transposed dims 2,3): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)num_heads, (int)headSize, (int)kvSeqLength);
+          } else if (key_is_transposed_internal) {
+            // Physical layout: [batch, kvSeqLength, num_heads, headSize] (dims 1,2 swapped)
+            keyPhysicalShape = @[@(batchSize), @(kvSeqLength), @(num_heads), @(headSize)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key physical shape (transposed dims 1,2): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)kvSeqLength, (int)num_heads, (int)headSize);
+          } else {
+            // Physical layout matches logical layout: [batch, num_heads, kvSeqLength, headSize]
+            keyPhysicalShape = @[@(batchSize), @(num_heads), @(kvSeqLength), @(headSize)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key physical shape (contiguous): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)num_heads, (int)kvSeqLength, (int)headSize);
+          }
+          
+          if (value_is_transposed_last2) {
+            // Physical layout: [batch, num_heads, headSize, kvSeqLength] (dims 2,3 swapped)
+            valuePhysicalShape = @[@(batchSize), @(num_heads), @(headSize), @(kvSeqLength)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value physical shape (transposed dims 2,3): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)num_heads, (int)headSize, (int)kvSeqLength);
+          } else if (value_is_transposed_internal) {
+            // Physical layout: [batch, kvSeqLength, num_heads, headSize] (dims 1,2 swapped)
+            valuePhysicalShape = @[@(batchSize), @(kvSeqLength), @(num_heads), @(headSize)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value physical shape (transposed dims 1,2): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)kvSeqLength, (int)num_heads, (int)headSize);
+          } else {
+            // Physical layout matches logical layout: [batch, num_heads, kvSeqLength, headSize]
+            valuePhysicalShape = @[@(batchSize), @(num_heads), @(kvSeqLength), @(headSize)];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value physical shape (contiguous): [%d,%d,%d,%d]",
+                   (int)batchSize, (int)num_heads, (int)kvSeqLength, (int)headSize);
+          }
 
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Creating placeholders with shapes Q:[%d,%d,%d,%d] K:[%d,%d,%d,%d] V:[%d,%d,%d,%d]",
-                 (int)batchSize, (int)num_heads, (int)qSize, (int)headSize,
-                 (int)batchSize, (int)num_heads, (int)kvSeqLength, (int)headSize,
-                 (int)batchSize, (int)num_heads, (int)kvSeqLength, (int)headSize);
-
-          // Create placeholders for input tensors
-          MPSGraphTensor* queryPlaceholder = [mpsGraph placeholderWithShape:queryShape
+          // Create placeholders for input tensors with physical shapes
+          MPSGraphTensor* queryPlaceholder = [mpsGraph placeholderWithShape:queryPhysicalShape
                                                                    dataType:mps_dtype
-                                                                       name:@"query"];
+                                                                       name:@"query_physical"];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created query placeholder");
 
-          MPSGraphTensor* keyPlaceholder = [mpsGraph placeholderWithShape:keyShape
+          MPSGraphTensor* keyPlaceholder = [mpsGraph placeholderWithShape:keyPhysicalShape
                                                                  dataType:mps_dtype
-                                                                     name:@"key"];
+                                                                     name:@"key_physical"];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created key placeholder");
 
-          MPSGraphTensor* valuePlaceholder = [mpsGraph placeholderWithShape:valueShape
+          MPSGraphTensor* valuePlaceholder = [mpsGraph placeholderWithShape:valuePhysicalShape
                                                                    dataType:mps_dtype
-                                                                       name:@"value"];
+                                                                       name:@"value_physical"];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created value placeholder");
+          
+          // Apply transpose operations in the graph to convert physical to logical layout
+          // Logical shapes needed for SDPA: Q[batch, num_heads, qSize, headSize], 
+          //                                 K[batch, num_heads, kvSeqLength, headSize],
+          //                                 V[batch, num_heads, kvSeqLength, headSize]
+          MPSGraphTensor* queryLogical;
+          MPSGraphTensor* keyLogical;
+          MPSGraphTensor* valueLogical;
+          
+          if (query_is_transposed_last2) {
+            // Transpose dims 2,3: [batch, num_heads, headSize, qSize] → [batch, num_heads, qSize, headSize]
+            queryLogical = [mpsGraph transposeTensor:queryPlaceholder
+                                           dimension:-2
+                                       withDimension:-1
+                                                name:@"query_transposed_last2"];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Applied transpose (dims 2,3) to query tensor in graph");
+          } else if (query_is_transposed_internal) {
+            // Transpose dims 1,2: [batch, qSize, num_heads, headSize] → [batch, num_heads, qSize, headSize]
+            queryLogical = [mpsGraph transposeTensor:queryPlaceholder
+                                           dimension:1
+                                       withDimension:2
+                                                name:@"query_transposed_internal"];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Applied transpose (dims 1,2) to query tensor in graph");
+          } else {
+            queryLogical = queryPlaceholder;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Using query placeholder directly (no transpose needed)");
+          }
+          
+          if (key_is_transposed_last2) {
+            // Transpose dims 2,3: [batch, num_heads, headSize, kvSeqLength] → [batch, num_heads, kvSeqLength, headSize]
+            keyLogical = [mpsGraph transposeTensor:keyPlaceholder
+                                         dimension:-2
+                                     withDimension:-1
+                                              name:@"key_transposed_last2"];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Applied transpose (dims 2,3) to key tensor in graph");
+          } else if (key_is_transposed_internal) {
+            // Transpose dims 1,2: [batch, kvSeqLength, num_heads, headSize] → [batch, num_heads, kvSeqLength, headSize]
+            keyLogical = [mpsGraph transposeTensor:keyPlaceholder
+                                         dimension:1
+                                     withDimension:2
+                                              name:@"key_transposed_internal"];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Applied transpose (dims 1,2) to key tensor in graph");
+          } else {
+            keyLogical = keyPlaceholder;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Using key placeholder directly (no transpose needed)");
+          }
+          
+          if (value_is_transposed_last2) {
+            // Transpose dims 2,3: [batch, num_heads, headSize, kvSeqLength] → [batch, num_heads, kvSeqLength, headSize]
+            valueLogical = [mpsGraph transposeTensor:valuePlaceholder
+                                           dimension:-2
+                                       withDimension:-1
+                                                name:@"value_transposed_last2"];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Applied transpose (dims 2,3) to value tensor in graph");
+          } else if (value_is_transposed_internal) {
+            // Transpose dims 1,2: [batch, kvSeqLength, num_heads, headSize] → [batch, num_heads, kvSeqLength, headSize]
+            valueLogical = [mpsGraph transposeTensor:valuePlaceholder
+                                           dimension:1
+                                       withDimension:2
+                                                name:@"value_transposed_internal"];
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Applied transpose (dims 1,2) to value tensor in graph");
+          } else {
+            valueLogical = valuePlaceholder;
+            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Using value placeholder directly (no transpose needed)");
+          }
 
           MPSGraphTensor* maskTensor = nil;
 
@@ -1270,12 +1487,13 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
             ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created explicit mask placeholder");
           }
 
-          // Perform scaled dot product attention using MPSGraph
+          // Perform scaled dot product attention using MPSGraph with logical (possibly transposed) tensors
+          // The logical tensors have the correct shapes for attention computation regardless of input memory layout
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Calling scaledDotProductAttentionWithQueryTensor with scale=%f", scale_factor);
 
-          MPSGraphTensor* outputTensor = [mpsGraph scaledDotProductAttentionWithQueryTensor:queryPlaceholder
-                                                                                 keyTensor:keyPlaceholder
-                                                                               valueTensor:valuePlaceholder
+          MPSGraphTensor* outputTensor = [mpsGraph scaledDotProductAttentionWithQueryTensor:queryLogical
+                                                                                 keyTensor:keyLogical
+                                                                               valueTensor:valueLogical
                                                                                 maskTensor:maskTensor
                                                                                      scale:scale_factor
                                                                                       name:@"scaled_dot_product_attention"];
@@ -1285,17 +1503,18 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
           ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created feeds dictionary");
 
-          // Create MPSGraphTensorData objects for input tensors
+          // Create MPSGraphTensorData objects for input tensors using physical shapes
+          // Physical shapes match the actual memory layout of the tensors
           MPSGraphTensorData* queryData = [[MPSGraphTensorData alloc] initWithMTLBuffer:query_buffer
-                                                                                  shape:queryShape
+                                                                                  shape:queryPhysicalShape
                                                                                dataType:mps_dtype];
           MPSGraphTensorData* keyData = [[MPSGraphTensorData alloc] initWithMTLBuffer:key_buffer
-                                                                                shape:keyShape
+                                                                                shape:keyPhysicalShape
                                                                              dataType:mps_dtype];
           MPSGraphTensorData* valueData = [[MPSGraphTensorData alloc] initWithMTLBuffer:value_buffer
-                                                                                  shape:valueShape
+                                                                                  shape:valuePhysicalShape
                                                                                dataType:mps_dtype];
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created MPSGraphTensorData objects for inputs");
+          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Created MPSGraphTensorData objects with physical shapes");
 
           feeds[queryPlaceholder] = queryData;
           feeds[keyPlaceholder] = keyData;
