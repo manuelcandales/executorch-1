@@ -423,6 +423,40 @@ class AddSDPA(nn.Module):
         return result
 
 
+class AddStridedSDPA(nn.Module):
+    """
+    SDPA model with Q, K, V as parameters that adds an input to the SDPA output.
+    Query, Key, Value are model parameters. Takes one input and adds it to SDPA result.
+    """
+    def __init__(self, batch_size=10, num_heads=20, seq_len=1500, head_dim=64, strides=[1920000, 64, 1280, 1]):
+        super().__init__()
+        self.strides = strides
+
+        # Q, K, V as model parameters
+        self.query = nn.Parameter(torch.randn(batch_size, num_heads, seq_len, head_dim))
+        self.key = nn.Parameter(torch.randn(batch_size, num_heads, seq_len, head_dim))
+        self.value = nn.Parameter(torch.randn(batch_size, num_heads, seq_len, head_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Call SDPA with parameter Q, K, V
+        # This will call our implemented aoti_torch_mps__scaled_dot_product_attention_math_for_mps
+
+        query = torch.as_strided(self.query, size=[10, 20, 1500, 64], stride=self.strides)
+        key = torch.as_strided(self.key, size=[10, 20, 1500, 64], stride=self.strides)
+        value = torch.as_strided(self.value, size=[10, 20, 1500, 64], stride=self.strides)
+
+        sdpa_output = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value,
+            dropout_p=0.0,
+            is_causal=False
+        )
+
+        # Add input x to SDPA output
+        result = sdpa_output + x
+
+        return result
+
+
 # Model registry mapping model names to their configurations
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "mv2": {
@@ -544,6 +578,11 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "model_class": AddSDPA,
         "input_shapes": [(2, 4, 16, 64)],  # input x: (batch, num_heads, seq_len, head_dim) - same shape as SDPA output
         "description": "SDPA model with Q,K,V as parameters that adds input to SDPA output",
+    },
+    "audio_encoder_sdpa1": {
+        "model_class": AddStridedSDPA,
+        "input_shapes": [(10, 20, 1500, 64)],
+        "description": "Audio Encoder model with SDPA1",
     },
 }
 
