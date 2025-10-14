@@ -81,6 +81,25 @@ AOTITorchError aoti_torch_mps_mm_out(
              out_tensor->dim() > 0 ? (int)out_tensor->sizes()[0] : 0,
              out_tensor->dim() > 1 ? (int)out_tensor->sizes()[1] : 0);
 
+      // Check if mat2 is transposed (non-contiguous due to transpose)
+      // A transposed matrix will have stride(-2) == 1 (column-major instead of row-major)
+      // For a 2D tensor with shape [K, N]:
+      //   - Contiguous (row-major): strides = [N, 1]
+      //   - Transposed (column-major): strides = [1, K]
+      bool mat2_is_transposed = false;
+      int64_t mat2_stride_0 = mat2_tensor->strides()[0];  // stride for dimension 0
+      int64_t mat2_stride_1 = mat2_tensor->strides()[1];  // stride for dimension 1
+      
+      // Detect transposed layout: stride(-2) == 1 indicates column-major layout
+      if (mat2_stride_0 == 1 && mat2_stride_1 != 1) {
+        mat2_is_transposed = true;
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: mat2 is transposed (strides=[%lld, %lld])", 
+               mat2_stride_0, mat2_stride_1);
+      } else {
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: mat2 is contiguous (strides=[%lld, %lld])", 
+               mat2_stride_0, mat2_stride_1);
+      }
+
       // Use the same dispatch pattern as other MPS operations for consistent synchronization
       ETMetalStream* stream = getCurrentMetalStream();
       if (!stream) {
@@ -156,25 +175,56 @@ AOTITorchError aoti_torch_mps_mm_out(
 
       // Define tensor shapes for placeholders
       NSArray<NSNumber*>* selfShape = @[@(M), @(K)];
-      NSArray<NSNumber*>* mat2Shape = @[@(K), @(N)];
       NSArray<NSNumber*>* outShape = @[@(M), @(N)];
 
+      // For mat2, we need to handle both contiguous and transposed cases
+      // If mat2 is transposed, its physical layout in memory is [N, K] (column-major)
+      // but logically we need [K, N] for the matrix multiplication
+      NSArray<NSNumber*>* mat2PhysicalShape;
+      if (mat2_is_transposed) {
+        // Physical shape reflects the actual memory layout (transposed)
+        mat2PhysicalShape = @[@(N), @(K)];
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: mat2 physical shape (transposed): [%d,%d]", (int)N, (int)K);
+      } else {
+        // Physical shape is the logical shape (contiguous)
+        mat2PhysicalShape = @[@(K), @(N)];
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: mat2 physical shape (contiguous): [%d,%d]", (int)K, (int)N);
+      }
+
       ET_LOG(Debug, "aoti_torch_mps_mm_out: Creating placeholders with shapes self:[%d,%d] mat2:[%d,%d]",
-             (int)M, (int)K, (int)K, (int)N);
+             (int)M, (int)K, 
+             mat2_is_transposed ? (int)N : (int)K,
+             mat2_is_transposed ? (int)K : (int)N);
 
       // Create placeholders for input tensors
       MPSGraphTensor* selfPlaceholder = [mpsGraph placeholderWithShape:selfShape
                                                               dataType:mps_dtype
                                                                   name:@"self"];
-      MPSGraphTensor* mat2Placeholder = [mpsGraph placeholderWithShape:mat2Shape
+      MPSGraphTensor* mat2Placeholder = [mpsGraph placeholderWithShape:mat2PhysicalShape
                                                               dataType:mps_dtype
-                                                                  name:@"mat2"];
+                                                                  name:@"mat2_physical"];
 
       ET_LOG(Debug, "aoti_torch_mps_mm_out: Created input placeholders");
 
-      // Perform matrix multiplication using MPSGraph
+      // If mat2 is transposed, apply transpose operation in the graph to get the logical shape
+      MPSGraphTensor* mat2Logical;
+      if (mat2_is_transposed) {
+        // Transpose from physical [N, K] to logical [K, N]
+        // MPSGraph transposeTensor swaps the last two dimensions for 2D tensors
+        mat2Logical = [mpsGraph transposeTensor:mat2Placeholder
+                                      dimension:-2
+                                  withDimension:-1
+                                           name:@"mat2_transposed"];
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: Applied transpose operation to mat2 in graph");
+      } else {
+        // No transpose needed, use placeholder directly
+        mat2Logical = mat2Placeholder;
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: Using mat2 placeholder directly (no transpose needed)");
+      }
+
+      // Perform matrix multiplication using MPSGraph with the logical mat2 tensor
       MPSGraphTensor* mmOutput = [mpsGraph matrixMultiplicationWithPrimaryTensor:selfPlaceholder
-                                                                 secondaryTensor:mat2Placeholder
+                                                                 secondaryTensor:mat2Logical
                                                                             name:@"matrix_multiplication"];
 
       ET_LOG(Debug, "aoti_torch_mps_mm_out: Successfully created matrix multiplication tensor");
@@ -183,17 +233,18 @@ AOTITorchError aoti_torch_mps_mm_out(
       NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
 
       // Create MPSGraphTensorData objects for input tensors
+      // Use physical shapes to match how data is actually laid out in memory
       MPSGraphTensorData* selfData = [[MPSGraphTensorData alloc] initWithMTLBuffer:self_buffer
                                                                               shape:selfShape
                                                                            dataType:mps_dtype];
       MPSGraphTensorData* mat2Data = [[MPSGraphTensorData alloc] initWithMTLBuffer:mat2_buffer
-                                                                              shape:mat2Shape
+                                                                              shape:mat2PhysicalShape
                                                                            dataType:mps_dtype];
 
       feeds[selfPlaceholder] = selfData;
       feeds[mat2Placeholder] = mat2Data;
 
-      ET_LOG(Debug, "aoti_torch_mps_mm_out: Created feeds dictionary");
+      ET_LOG(Debug, "aoti_torch_mps_mm_out: Created feeds dictionary with physical shapes");
 
       // Create results dictionary
       MPSGraphTensorData* outputData = [[MPSGraphTensorData alloc] initWithMTLBuffer:out_buffer
