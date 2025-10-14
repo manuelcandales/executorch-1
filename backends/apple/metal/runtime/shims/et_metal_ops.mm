@@ -89,14 +89,14 @@ AOTITorchError aoti_torch_mps_mm_out(
       bool mat2_is_transposed = false;
       int64_t mat2_stride_0 = mat2_tensor->strides()[0];  // stride for dimension 0
       int64_t mat2_stride_1 = mat2_tensor->strides()[1];  // stride for dimension 1
-      
+
       // Detect transposed layout: stride(-2) == 1 indicates column-major layout
       if (mat2_stride_0 == 1 && mat2_stride_1 != 1) {
         mat2_is_transposed = true;
-        ET_LOG(Debug, "aoti_torch_mps_mm_out: mat2 is transposed (strides=[%lld, %lld])", 
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: mat2 is transposed (strides=[%lld, %lld])",
                mat2_stride_0, mat2_stride_1);
       } else {
-        ET_LOG(Debug, "aoti_torch_mps_mm_out: mat2 is contiguous (strides=[%lld, %lld])", 
+        ET_LOG(Debug, "aoti_torch_mps_mm_out: mat2 is contiguous (strides=[%lld, %lld])",
                mat2_stride_0, mat2_stride_1);
       }
 
@@ -192,7 +192,7 @@ AOTITorchError aoti_torch_mps_mm_out(
       }
 
       ET_LOG(Debug, "aoti_torch_mps_mm_out: Creating placeholders with shapes self:[%d,%d] mat2:[%d,%d]",
-             (int)M, (int)K, 
+             (int)M, (int)K,
              mat2_is_transposed ? (int)N : (int)K,
              mat2_is_transposed ? (int)K : (int)N);
 
@@ -849,7 +849,132 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
     AOTITensorHandle* ret0,
     AOTITensorHandle* ret1) {
 
-  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Starting with MPSGraph implementation");
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Starting with MPSGraph implementation");
+
+  // Log non-tensor arguments
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Non-tensor arguments - dropout_p=%f, is_causal=%d, scale=%s",
+         dropout_p, is_causal, scale ? std::to_string(*scale).c_str() : "null");
+
+  // Log tensor handle addresses for debugging
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Tensor handles - query=%p, key=%p, value=%p, attn_mask=%p, dropout_mask=%p",
+         query, key, value,
+         (attn_mask && *attn_mask) ? *attn_mask : nullptr,
+         (dropout_mask && *dropout_mask) ? *dropout_mask : nullptr);
+
+  if (!query || !key || !value || !ret0 || !ret1) {
+    ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: null required tensor handles");
+    return Error::InvalidArgument;
+  }
+
+  // Convert AOTITensorHandle to ExecutorTorch tensors for logging tensor properties
+  auto* query_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(query);
+  auto* key_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(key);
+  auto* value_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(value);
+
+  // Log query tensor properties
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Query tensor - dtype=%d, dim=%d",
+         static_cast<int32_t>(query_tensor->scalar_type()), query_tensor->dim());
+
+  std::string query_sizes = "[";
+  std::string query_strides = "[";
+  for (int i = 0; i < query_tensor->dim(); i++) {
+    query_sizes += std::to_string(query_tensor->sizes()[i]);
+    query_strides += std::to_string(query_tensor->strides()[i]);
+    if (i < query_tensor->dim() - 1) {
+      query_sizes += ", ";
+      query_strides += ", ";
+    }
+  }
+  query_sizes += "]";
+  query_strides += "]";
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Query tensor - sizes=%s, strides=%s",
+         query_sizes.c_str(), query_strides.c_str());
+
+  // Log key tensor properties
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Key tensor - dtype=%d, dim=%d",
+         static_cast<int32_t>(key_tensor->scalar_type()), key_tensor->dim());
+
+  std::string key_sizes = "[";
+  std::string key_strides = "[";
+  for (int i = 0; i < key_tensor->dim(); i++) {
+    key_sizes += std::to_string(key_tensor->sizes()[i]);
+    key_strides += std::to_string(key_tensor->strides()[i]);
+    if (i < key_tensor->dim() - 1) {
+      key_sizes += ", ";
+      key_strides += ", ";
+    }
+  }
+  key_sizes += "]";
+  key_strides += "]";
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Key tensor - sizes=%s, strides=%s",
+         key_sizes.c_str(), key_strides.c_str());
+
+  // Log value tensor properties
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Value tensor - dtype=%d, dim=%d",
+         static_cast<int32_t>(value_tensor->scalar_type()), value_tensor->dim());
+
+  std::string value_sizes = "[";
+  std::string value_strides = "[";
+  for (int i = 0; i < value_tensor->dim(); i++) {
+    value_sizes += std::to_string(value_tensor->sizes()[i]);
+    value_strides += std::to_string(value_tensor->strides()[i]);
+    if (i < value_tensor->dim() - 1) {
+      value_sizes += ", ";
+      value_strides += ", ";
+    }
+  }
+  value_sizes += "]";
+  value_strides += "]";
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Value tensor - sizes=%s, strides=%s",
+         value_sizes.c_str(), value_strides.c_str());
+
+  // Log attention mask tensor properties if present
+  if (attn_mask && *attn_mask) {
+    auto* mask_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(*attn_mask);
+    ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Attention mask tensor - dtype=%d, dim=%d",
+           static_cast<int32_t>(mask_tensor->scalar_type()), mask_tensor->dim());
+
+    std::string mask_sizes = "[";
+    std::string mask_strides = "[";
+    for (int i = 0; i < mask_tensor->dim(); i++) {
+      mask_sizes += std::to_string(mask_tensor->sizes()[i]);
+      mask_strides += std::to_string(mask_tensor->strides()[i]);
+      if (i < mask_tensor->dim() - 1) {
+        mask_sizes += ", ";
+        mask_strides += ", ";
+      }
+    }
+    mask_sizes += "]";
+    mask_strides += "]";
+    ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Attention mask tensor - sizes=%s, strides=%s",
+           mask_sizes.c_str(), mask_strides.c_str());
+  } else {
+    ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: No attention mask tensor provided");
+  }
+
+  // Log dropout mask tensor properties if present
+  if (dropout_mask && *dropout_mask) {
+    auto* dropout_tensor = reinterpret_cast<executorch::runtime::etensor::Tensor*>(*dropout_mask);
+    ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Dropout mask tensor - dtype=%d, dim=%d",
+           static_cast<int32_t>(dropout_tensor->scalar_type()), dropout_tensor->dim());
+
+    std::string dropout_sizes = "[";
+    std::string dropout_strides = "[";
+    for (int i = 0; i < dropout_tensor->dim(); i++) {
+      dropout_sizes += std::to_string(dropout_tensor->sizes()[i]);
+      dropout_strides += std::to_string(dropout_tensor->strides()[i]);
+      if (i < dropout_tensor->dim() - 1) {
+        dropout_sizes += ", ";
+        dropout_strides += ", ";
+      }
+    }
+    dropout_sizes += "]";
+    dropout_strides += "]";
+    ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: Dropout mask tensor - sizes=%s, strides=%s",
+           dropout_sizes.c_str(), dropout_strides.c_str());
+  } else {
+    ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps args: No dropout mask tensor provided");
+  }
 
   if (!query || !key || !value || !ret0 || !ret1) {
     ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: null required tensor handles");
