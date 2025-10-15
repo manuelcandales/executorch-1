@@ -64,6 +64,10 @@ xcuserdata/
 /version.py
 *_etdump
 
+# AOTI debug data
+aoti_debug_data/*
+aoti_*.pt2
+
 # Android
 *.aar
 
