@@ -57,6 +57,11 @@ DEFINE_int32(
     -1,
     "Number of CPU threads for inference. Defaults to -1, which implies we'll use a heuristic to derive the # of performant cores for a specific device.");
 
+DEFINE_int32(
+    max_new_tokens,
+    100,
+    "Maximum number of new tokens to generate. Default is 100.");
+
 DEFINE_bool(warmup, false, "Whether to run a warmup run.");
 
 namespace {
@@ -340,7 +345,7 @@ int32_t main(int32_t argc, char** argv) {
   };
 
   ::executorch::extension::llm::GenerationConfig config;
-  config.max_new_tokens = 100;
+  config.max_new_tokens = FLAGS_max_new_tokens;
   config.temperature = temperature;
 
   // Run warmup if requested

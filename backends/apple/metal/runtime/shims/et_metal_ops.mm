@@ -180,6 +180,8 @@ AOTITorchError aoti_torch_mps_mm_out(
       ET_LOG(Debug, "aoti_torch_mps_mm_out: dtype=%d, element_size=%zu", dtype, element_size);
       ET_LOG(Debug, "aoti_torch_mps_mm_out: M=%lld, K=%lld, N=%lld", M, K, N);
 
+      //return Error::Ok;
+
       // Create MPSGraph for matrix multiplication
       MPSGraph* mpsGraph = [MPSGraph new];
       ET_LOG(Debug, "aoti_torch_mps_mm_out: Created MPSGraph instance");
@@ -270,7 +272,7 @@ AOTITorchError aoti_torch_mps_mm_out(
 
       @try {
         // Use stream helper to encode and synchronize correctly
-        stream->executeMPSGraph(mpsGraph, feeds, results, SyncType::COMMIT_AND_CONTINUE);
+        stream->executeMPSGraph(mpsGraph, feeds, results, SyncType::COMMIT_AND_WAIT);
       } @catch (NSException *exception) {
         ET_LOG(Error, "aoti_torch_mps_mm_out: NSException caught during executeMPSGraph: %s - %s",
               [[exception name] UTF8String], [[exception reason] UTF8String]);
@@ -772,6 +774,94 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
   if (!query || !key || !value || !ret0 || !ret1) {
     ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: null required tensor handles");
     return Error::InvalidArgument;
+  }
+
+  // Short circuit: copy query to new tensor to measure SDPA impact
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Short circuit - copying query");
+
+  try {
+    @autoreleasepool {
+      auto* query_tensor = reinterpret_cast<Tensor*>(query);
+
+      // Get query tensor dimensions and properties
+      int32_t dtype = static_cast<int32_t>(query_tensor->scalar_type());
+      size_t element_size;
+      if (dtype == static_cast<int32_t>(SupportedDTypes::FLOAT32)) {
+        element_size = sizeof(float);
+      } else if (dtype == static_cast<int32_t>(SupportedDTypes::BFLOAT16)) {
+        element_size = sizeof(uint16_t);
+      } else {
+        ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Unsupported data type: %d", dtype);
+        return Error::InvalidArgument;
+      }
+
+      // Calculate output size
+      size_t numel = query_tensor->numel();
+      size_t output_size_bytes = numel * element_size;
+
+      // Allocate output buffer
+      void* output_contents_ptr = nullptr;
+      id<MTLBuffer> output_buffer = allocate_mtl_buffer(&output_contents_ptr, output_size_bytes);
+
+      // Get input buffer
+      id<MTLBuffer> query_buffer = get_mtl_buffer(query_tensor, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps", "query");
+
+      // Get Metal stream
+      ETMetalStream* stream = getCurrentMetalStream();
+      if (!stream) {
+        ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to get current Metal stream");
+        aoti_torch_mps_free(output_contents_ptr);
+        return Error::Internal;
+      }
+
+      // Copy data using ETMetalStream's copy method
+      stream->copy(query_buffer, output_buffer, output_size_bytes, 0, 0, SyncType::COMMIT_AND_WAIT);
+
+      // Create output tensor with same shape and strides as query
+      std::vector<int64_t> output_sizes;
+      std::vector<int64_t> output_strides;
+      for (int i = 0; i < query_tensor->dim(); i++) {
+        output_sizes.push_back(query_tensor->sizes()[i]);
+        output_strides.push_back(query_tensor->strides()[i]);
+      }
+
+      AOTITensorHandle output_tensor_handle = nullptr;
+      AOTITorchError create_result = aoti_torch_create_tensor_from_blob_v2(
+          output_contents_ptr,
+          static_cast<int64_t>(output_sizes.size()),
+          output_sizes.data(),
+          output_strides.data(),
+          0,  // storage_offset
+          dtype,
+          13,  // device_type (MPS)
+          0,  // device_index
+          &output_tensor_handle,
+          0,  // layout (strided)
+          nullptr,  // opaque_metadata
+          0   // opaque_metadata_size
+      );
+
+      if (create_result != Error::Ok || !output_tensor_handle) {
+        ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to create output tensor");
+        aoti_torch_mps_free(output_contents_ptr);
+        return Error::Internal;
+      }
+
+      auto* out_et_tensor = reinterpret_cast<Tensor*>(output_tensor_handle);
+      is_tensor_own_memory[out_et_tensor] = true;
+
+      *ret0 = output_tensor_handle;
+      *ret1 = nullptr;
+
+      ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Short circuit completed - copied query");
+      return Error::Ok;
+    }
+  } catch (const std::exception& e) {
+    ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps short circuit exception: %s", e.what());
+    return Error::Internal;
+  } catch (...) {
+    ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: short circuit unknown exception");
+    return Error::Internal;
   }
 
   // Use the same dispatch pattern as other MPS operations for consistent synchronization
