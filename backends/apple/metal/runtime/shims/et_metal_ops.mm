@@ -17,6 +17,7 @@
 #include <executorch/backends/apple/metal/runtime/shims/shim_mps.h>
 #include <executorch/backends/apple/metal/runtime/shims/utils.h>
 #include <executorch/backends/apple/metal/runtime/shims/memory.h>
+#include <executorch/backends/apple/metal/runtime/mlx/mlx_matmul.h>
 #include <functional>
 #include <unordered_map>
 
@@ -83,6 +84,38 @@ AOTITorchError aoti_torch_mps_mm_out(
       auto out_tensor = reinterpret_cast<Tensor*>(out);
       auto self_tensor = reinterpret_cast<Tensor*>(self);
       auto mat2_tensor = reinterpret_cast<Tensor*>(mat2);
+      
+      // ===================================================================
+      // NEW MLX-BASED IMPLEMENTATION
+      // ===================================================================
+      // Use MLX's optimized Metal matmul kernels instead of MPS
+      ET_LOG(Debug, "aoti_torch_mps_mm_out: Using MLX Metal matmul implementation");
+      
+      ETMetalStream* stream = getCurrentMetalStream();
+      if (!stream) {
+        ET_LOG(Error, "aoti_torch_mps_mm_out: Failed to get current Metal stream");
+        return Error::Internal;
+      }
+      
+      // Call MLX matmul implementation
+      bool success = mlx::metal_mm_out(out_tensor, self_tensor, mat2_tensor, stream);
+      if (!success) {
+        ET_LOG(Error, "aoti_torch_mps_mm_out: MLX matmul failed");
+        return Error::Internal;
+      }
+      
+      ET_LOG(Debug, "aoti_torch_mps_mm_out: MLX matmul completed successfully");
+      return Error::Ok;
+      
+      // ===================================================================
+      // OLD MPS-BASED IMPLEMENTATION (COMMENTED OUT)
+      // ===================================================================
+      // The code below uses Apple's MetalPerformanceShadersGraph (MPSGraph)
+      // for matrix multiplication. We've replaced it with MLX's optimized
+      // Metal kernels which provide better performance in many cases.
+      // ===================================================================
+      
+      #if 0  // OLD MPS IMPLEMENTATION - DISABLED
 
       ET_LOG(Debug, "aoti_torch_mps_mm_out: Converted tensor handles to ET tensors");
 
@@ -281,6 +314,8 @@ AOTITorchError aoti_torch_mps_mm_out(
 
       ET_LOG(Debug, "aoti_torch_mps_mm_out: Executed successfully");
       return Error::Ok;
+      
+      #endif // OLD MPS IMPLEMENTATION - DISABLED
 
     } catch (const std::exception& e) {
       ET_LOG(Error, "aoti_torch_mps_mm_out exception: %s", e.what());

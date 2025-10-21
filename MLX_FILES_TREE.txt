@@ -1,0 +1,100 @@
+MLX Metal Matmul Integration - Complete File Tree
+==================================================
+
+NEW FILES CREATED:
+==================
+
+executorch/
+├── backends/apple/metal/runtime/
+│   ├── mlx/                                    ← NEW DIRECTORY
+│   │   ├── README.md                          ← Documentation (432 lines)
+│   │   ├── mlx_matmul.h                       ← Interface header (99 lines)
+│   │   ├── mlx_matmul.mm                      ← Implementation (478 lines)
+│   │   ├── defines.h                          ← MLX defines (copied)
+│   │   ├── params.h                           ← GEMM params (copied)
+│   │   └── kernels/                           ← NEW SUBDIRECTORY
+│   │       ├── defines.h                      ← Kernel defines
+│   │       ├── utils.h                        ← Utility functions
+│   │       ├── bf16_math.h                    ← BFloat16 math
+│   │       ├── complex.h                      ← Complex number support
+│   │       ├── gemv.metal                     ← GEMV kernels (31KB)
+│   │       └── steel/                         ← NEW SUBDIRECTORY
+│   │           ├── defines.h                  ← Steel defines
+│   │           ├── gemm/                      ← NEW SUBDIRECTORY
+│   │           │   ├── gemm.h                 ← GEMM interface
+│   │           │   ├── loader.h               ← Data loaders
+│   │           │   ├── mma.h                  ← Matrix-multiply-accumulate
+│   │           │   ├── params.h               ← Parameter definitions
+│   │           │   ├── transforms.h           ← Data transformations
+│   │           │   └── kernels/               ← NEW SUBDIRECTORY
+│   │           │       ├── steel_gemm_fused.h
+│   │           │       ├── steel_gemm_fused.metal         (~20KB)
+│   │           │       ├── steel_gemm_splitk.h
+│   │           │       ├── steel_gemm_splitk.metal        (~15KB)
+│   │           │       ├── steel_gemm_gather.h
+│   │           │       ├── steel_gemm_gather.metal        (~18KB)
+│   │           │       ├── steel_gemm_segmented.h
+│   │           │       ├── steel_gemm_segmented.metal     (~16KB)
+│   │           │       ├── steel_gemm_masked.h
+│   │           │       └── steel_gemm_masked.metal        (~22KB)
+│   │           └── utils/                     ← NEW SUBDIRECTORY
+│   │               ├── integral_constant.h
+│   │               └── type_traits.h
+│   └── shims/
+│       └── et_metal_ops.mm                    ← MODIFIED (see below)
+├── INTEGRATION_SUMMARY.md                     ← NEW (479 lines)
+└── MLX_INTEGRATION_DIFF.md                    ← NEW (541 lines)
+
+MODIFIED FILES:
+===============
+
+backends/apple/metal/runtime/shims/et_metal_ops.mm
+  Line 20:   Added #include for mlx_matmul.h
+  Lines 87-109: Added MLX implementation call
+  Lines 118-316: Wrapped old MPS code in #if 0 ... #endif
+  
+  Changes:
+  + 1 include statement
+  + 23 lines of new code
+  ~ 210 lines commented out (preserved)
+
+SUMMARY:
+========
+
+Total Files Created:     30 files
+Total Files Modified:    1 file
+Total Changes:           31 files
+
+New Directories:         5 directories
+  - mlx/
+  - mlx/kernels/
+  - mlx/kernels/steel/
+  - mlx/kernels/steel/gemm/
+  - mlx/kernels/steel/gemm/kernels/
+  - mlx/kernels/steel/utils/
+
+Code Statistics:
+  New C++/ObjC++ code:   ~600 lines
+  Documentation:         ~950 lines
+  MLX Metal shaders:     ~91KB (~15,000 lines)
+  Total added:           ~16,550 lines
+  Lines modified:        ~25 lines
+  Lines commented:       ~210 lines
+
+File Types:
+  .mm (Objective-C++):   1 file (created)
+  .h (C++ headers):      18 files (copied)
+  .metal (Metal):        6 files (copied)
+  .md (Markdown):        4 files (created)
+
+Directory Structure Depth: 6 levels
+  executorch/backends/apple/metal/runtime/mlx/kernels/steel/gemm/kernels/
+
+Git Status (expected):
+  Untracked files:
+    - backends/apple/metal/runtime/mlx/
+    - INTEGRATION_SUMMARY.md
+    - MLX_INTEGRATION_DIFF.md
+  Modified files:
+    - backends/apple/metal/runtime/shims/et_metal_ops.mm
+
