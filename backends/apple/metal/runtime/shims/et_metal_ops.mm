@@ -1502,8 +1502,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         bool float_mask_val = false;
         if (has_mask_val) {
           auto* mask_tensor = reinterpret_cast<Tensor*>(*attn_mask);
-          int32_t mask_dtype = static_cast<int32_t>(mask_tensor->scalar_type());
-          bool_mask_val = (mask_dtype == static_cast<int32_t>(SupportedDTypes::BOOL));
+          bool_mask_val = (mask_tensor->scalar_type() == executorch::aten::ScalarType::Bool);
           float_mask_val = !bool_mask_val;
         }
 
