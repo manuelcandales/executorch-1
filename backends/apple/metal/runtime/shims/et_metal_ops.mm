@@ -1154,7 +1154,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
     AOTITensorHandle* ret0,
     AOTITensorHandle* ret1) {
 
-  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Starting with MPSGraph implementation");
+  ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Starting with Metal kernel implementation");
 
   if (!query || !key || !value || !ret0 || !ret1) {
     ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: null required tensor handles");
@@ -1197,126 +1197,18 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: batchSize=%lld, num_heads=%lld, qSize=%lld, headSize=%lld, kvSeqLength=%lld",
                batchSize, num_heads, qSize, headSize, kvSeqLength);
 
-        // Detect non-contiguous layouts for query, key, and value tensors
-        // For a 4D tensor [batch, num_heads, seq_len, head_dim], common non-contiguous patterns:
-        // - Transposed last 2 dims (dims 2,3): strides[2] == 1 && strides[3] == seq_len (seq_len and head_dim swapped)
-        // - Transposed internal dims (dims 1,2): strides[1] == head_dim && strides[2] == num_heads*head_dim (num_heads and seq_len swapped)
-        // - Other permutations may exist depending on upstream operations
-
-        bool query_is_transposed_last2 = false;   // transpose of dims -2 and -1
-        bool query_is_transposed_internal = false; // transpose of dims 1 and 2
-        bool key_is_transposed_last2 = false;
-        bool key_is_transposed_internal = false;
-        bool value_is_transposed_last2 = false;
-        bool value_is_transposed_internal = false;
-
-        // Expected contiguous strides for query [batch, num_heads, qSize, headSize]
-        int64_t expected_q_stride_3 = 1;
-        int64_t expected_q_stride_2 = headSize;
-        int64_t expected_q_stride_1 = qSize * headSize;
-        int64_t expected_q_stride_0 = num_heads * qSize * headSize;
-
-        // Check query tensor layout
-        auto q_strides = query_tensor->strides();
-        if (q_strides[3] != expected_q_stride_3 || q_strides[2] != expected_q_stride_2 ||
-            q_strides[1] != expected_q_stride_1) {
-          // Check if it's a transpose of the last two dimensions (dims 2 and 3)
-          if (q_strides[2] == 1 && q_strides[3] == qSize && q_strides[1] == qSize * headSize) {
-            query_is_transposed_last2 = true;
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query tensor has transposed last 2 dims (dims 2,3) (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)q_strides[0], (int64_t)q_strides[1], (int64_t)q_strides[2], (int64_t)q_strides[3]);
-          }
-          // Check if it's a transpose of the internal dimensions (dims 1 and 2)
-          else if (q_strides[1] == headSize && q_strides[2] == num_heads * headSize && q_strides[3] == 1) {
-            query_is_transposed_internal = true;
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query tensor has transposed internal dims (dims 1,2) (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)q_strides[0], (int64_t)q_strides[1], (int64_t)q_strides[2], (int64_t)q_strides[3]);
-          } else {
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query tensor is non-contiguous with unusual layout (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)q_strides[0], (int64_t)q_strides[1], (int64_t)q_strides[2], (int64_t)q_strides[3]);
-          }
-        } else {
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Query tensor is contiguous (strides=[%lld,%lld,%lld,%lld])",
-                 (int64_t)q_strides[0], (int64_t)q_strides[1], (int64_t)q_strides[2], (int64_t)q_strides[3]);
-        }
-
-        // Expected contiguous strides for key [batch, num_heads, kvSeqLength, headSize]
-        int64_t expected_k_stride_3 = 1;
-        int64_t expected_k_stride_2 = headSize;
-        int64_t expected_k_stride_1 = kvSeqLength * headSize;
-        int64_t expected_k_stride_0 = num_heads * kvSeqLength * headSize;
-
-        // Check key tensor layout
-        auto k_strides = key_tensor->strides();
-        if (k_strides[3] != expected_k_stride_3 || k_strides[2] != expected_k_stride_2 ||
-            k_strides[1] != expected_k_stride_1) {
-          // Check if it's a transpose of the last two dimensions (dims 2 and 3)
-          if (k_strides[2] == 1 && k_strides[3] == kvSeqLength && k_strides[1] == kvSeqLength * headSize) {
-            key_is_transposed_last2 = true;
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key tensor has transposed last 2 dims (dims 2,3) (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)k_strides[0], (int64_t)k_strides[1], (int64_t)k_strides[2], (int64_t)k_strides[3]);
-          }
-          // Check if it's a transpose of the internal dimensions (dims 1 and 2)
-          else if (k_strides[1] == headSize && k_strides[2] == num_heads * headSize && k_strides[3] == 1) {
-            key_is_transposed_internal = true;
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key tensor has transposed internal dims (dims 1,2) (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)k_strides[0], (int64_t)k_strides[1], (int64_t)k_strides[2], (int64_t)k_strides[3]);
-          } else {
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key tensor is non-contiguous with unusual layout (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)k_strides[0], (int64_t)k_strides[1], (int64_t)k_strides[2], (int64_t)k_strides[3]);
-          }
-        } else {
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Key tensor is contiguous (strides=[%lld,%lld,%lld,%lld])",
-                 (int64_t)k_strides[0], (int64_t)k_strides[1], (int64_t)k_strides[2], (int64_t)k_strides[3]);
-        }
-
-        // Expected contiguous strides for value [batch, num_heads, kvSeqLength, headSize]
-        int64_t expected_v_stride_3 = 1;
-        int64_t expected_v_stride_2 = headSize;
-        int64_t expected_v_stride_1 = kvSeqLength * headSize;
-        int64_t expected_v_stride_0 = num_heads * kvSeqLength * headSize;
-
-        // Check value tensor layout
-        auto v_strides = value_tensor->strides();
-        if (v_strides[3] != expected_v_stride_3 || v_strides[2] != expected_v_stride_2 ||
-            v_strides[1] != expected_v_stride_1) {
-          // Check if it's a transpose of the last two dimensions (dims 2 and 3)
-          if (v_strides[2] == 1 && v_strides[3] == kvSeqLength && v_strides[1] == kvSeqLength * headSize) {
-            value_is_transposed_last2 = true;
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value tensor has transposed last 2 dims (dims 2,3) (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)v_strides[0], (int64_t)v_strides[1], (int64_t)v_strides[2], (int64_t)v_strides[3]);
-          }
-          // Check if it's a transpose of the internal dimensions (dims 1 and 2)
-          else if (v_strides[1] == headSize && v_strides[2] == num_heads * headSize && v_strides[3] == 1) {
-            value_is_transposed_internal = true;
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value tensor has transposed internal dims (dims 1,2) (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)v_strides[0], (int64_t)v_strides[1], (int64_t)v_strides[2], (int64_t)v_strides[3]);
-          } else {
-            ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value tensor is non-contiguous with unusual layout (strides=[%lld,%lld,%lld,%lld])",
-                   (int64_t)v_strides[0], (int64_t)v_strides[1], (int64_t)v_strides[2], (int64_t)v_strides[3]);
-          }
-        } else {
-          ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Value tensor is contiguous (strides=[%lld,%lld,%lld,%lld])",
-                 (int64_t)v_strides[0], (int64_t)v_strides[1], (int64_t)v_strides[2], (int64_t)v_strides[3]);
-        }
-
         // Determine data type and element size
         int32_t dtype = static_cast<int32_t>(query_tensor->scalar_type());
-        MPSDataType mps_dtype;
         size_t element_size;
 
         if (dtype == static_cast<int32_t>(SupportedDTypes::FLOAT32)) {
-          mps_dtype = MPSDataTypeFloat32;
           element_size = sizeof(float);
         } else if (dtype == static_cast<int32_t>(SupportedDTypes::BFLOAT16)) {
-          mps_dtype = MPSDataTypeBFloat16;
           element_size = sizeof(uint16_t);  // bfloat16 is 16 bits
         } else {
           ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Unsupported data type: %d", dtype);
           throw std::runtime_error("Unsupported data type for scaled dot product attention");
         }
-
-        ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: mps_dtype=%d, element_size=%zu", mps_dtype, element_size);
 
         // Check that headSize is not zero to avoid division by zero
         if (headSize == 0) {
@@ -1327,18 +1219,6 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         // Calculate scale factor
         double scale_factor = scale ? *scale : (1.0 / sqrt(static_cast<double>(headSize)));
         ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: scale_factor=%f", scale_factor);
-
-        // Get Metal device
-        id<MTLDevice> device = get_metal_device();
-        if (!device) {
-          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Failed to get Metal device");
-          throw std::runtime_error("Failed to get Metal device");
-        }
-
-        // Get Metal buffers for query, key and value tensors
-        id<MTLBuffer> query_buffer = get_mtl_buffer(query_tensor, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps", "query");
-        id<MTLBuffer> key_buffer = get_mtl_buffer(key_tensor, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps", "key");
-        id<MTLBuffer> value_buffer = get_mtl_buffer(value_tensor, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps", "value");
 
         // Calculate output tensor dimensions
         std::vector<int64_t> output_sizes = {batchSize, num_heads, qSize, headSize};
@@ -1364,10 +1244,10 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
         size_t attn_size_bytes = batchSize * num_heads * qSize * kvSeqLength * element_size;
 
         void* out_contents_ptr = nullptr;
-        id<MTLBuffer> out_buffer = allocate_mtl_buffer(&out_contents_ptr, out_size_bytes);
+        allocate_mtl_buffer(&out_contents_ptr, out_size_bytes);
 
         void* attn_contents_ptr = nullptr;
-        id<MTLBuffer> attn_weights_buffer = allocate_mtl_buffer(&attn_contents_ptr, attn_size_bytes);
+        allocate_mtl_buffer(&attn_contents_ptr, attn_size_bytes);
 
         // End any existing kernel coalescing to ensure a clean state
         stream->endKernelCoalescing();
