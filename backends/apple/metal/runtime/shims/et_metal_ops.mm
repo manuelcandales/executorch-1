@@ -126,108 +126,49 @@ static id<MTLBuffer> allocate_mtl_buffer(void** data_ptr, size_t size_bytes) {
 // Helper function to get the Metal shader source for SDPA
 static std::string get_sdpa_metal_source() {
   return R"(
+// Ported from PyTorch's Attention.metal
+// https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/mps/kernels/Attention.metal
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_math>
 
 using namespace metal;
 
-#if defined __METAL__ || defined MLX_METAL_JIT
-#define MTL_CONST constant
-#else
-#define MTL_CONST
-#endif
-
-#define instantiate_kernel(name, func, ...) \
-  template [[host_name(                     \
-      name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
-
 typedef half float16_t;
 typedef bfloat bfloat16_t;
 
-template <typename U>
-struct Limits {
-  static const constant U max = metal::numeric_limits<U>::max();
-  static const constant U min = metal::numeric_limits<U>::min();
-  static const constant U finite_max = metal::numeric_limits<U>::max();
-  static const constant U finite_min = metal::numeric_limits<U>::min();
-};
-
-template <>
-struct Limits<half> {
-  static constexpr constant half max = metal::numeric_limits<half>::infinity();
-  static constexpr constant half min = -metal::numeric_limits<half>::infinity();
-  static constexpr constant half finite_max = metal::numeric_limits<half>::max();
-  static constexpr constant half finite_min = -metal::numeric_limits<half>::max();
-};
-
-template <>
-struct Limits<float> {
-  static constexpr constant float max = metal::numeric_limits<float>::infinity();
-  static constexpr constant float min = -metal::numeric_limits<float>::infinity();
-  static constexpr constant float finite_max = metal::numeric_limits<float>::max();
-  static constexpr constant float finite_min = -metal::numeric_limits<float>::max();
-};
-
-template <>
-struct Limits<bfloat16_t> {
-  static constexpr constant bfloat16_t max = metal::numeric_limits<bfloat16_t>::infinity();
-  static constexpr constant bfloat16_t min = -metal::numeric_limits<bfloat16_t>::infinity();
-  static constexpr constant bfloat16_t finite_max = metal::numeric_limits<bfloat16_t>::max();
-  static constexpr constant bfloat16_t finite_min = -metal::numeric_limits<bfloat16_t>::max();
-};
-
-namespace fast {
-  template<typename T>
-  METAL_FUNC T exp(T x) {
-    return metal::fast::exp(x);
-  }
-  
-  template<typename T>
-  METAL_FUNC T exp2(T x) {
-    return metal::fast::exp2(x);
-  }
-}
-
-// Note: Function constants are passed as regular int64_t arguments for compatibility
-// In a full implementation, these would be function constants for better performance
-const constant int64_t& has_mask_val [[buffer(11)]];
-const constant int64_t& query_transposed_val [[buffer(12)]];
-const constant int64_t& do_causal_val [[buffer(13)]];
-const constant int64_t& bool_mask_val [[buffer(14)]];
-const constant int64_t& float_mask_val [[buffer(15)]];
-const constant int64_t& has_sinks_val [[buffer(16)]];
-
+// PyTorch's sdpa_vector kernel (one-pass variant)
+// Adapted to accept separate uint values instead of uint3 for ExecuTorch API compatibility
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
     device T* out [[buffer(3)]],
-    const constant int& gqa_factor [[buffer(4)]],
-    const constant int& N [[buffer(5)]],
-    const constant size_t& k_head_stride [[buffer(6)]],
-    const constant size_t& k_seq_stride [[buffer(7)]],
-    const constant size_t& v_head_stride [[buffer(8)]],
-    const constant size_t& v_seq_stride [[buffer(9)]],
-    const constant int32_t& scale_bits [[buffer(10)]],
-    const device bool* bmask [[buffer(17)]],
-    const device T* fmask [[buffer(18)]],
-    const constant int& mask_kv_seq_stride [[buffer(19)]],
-    const constant int& mask_q_seq_stride [[buffer(20)]],
-    const constant int& mask_head_stride [[buffer(21)]],
-    const device T* sinks [[buffer(22)]],
-    const constant int& num_q_heads [[buffer(23)]],
+    constant uint& gqa_factor [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    constant uint& q_head_stride [[buffer(6)]],
+    constant uint& k_head_stride [[buffer(7)]],
+    constant uint& v_head_stride [[buffer(8)]],
+    constant uint& q_seq_stride [[buffer(9)]],
+    constant uint& k_seq_stride [[buffer(10)]],
+    constant uint& v_seq_stride [[buffer(11)]],
+    constant uint& scale_bits [[buffer(12)]],
+    const device bool* mask [[buffer(13)]],
+    constant uint& mask_head_stride [[buffer(14)]],
+    constant uint& mask_kv_seq_stride [[buffer(15)]],
+    constant uint& mask_q_seq_stride [[buffer(16)]],
+    constant uint& has_mask_val [[buffer(17)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int BN = 32;
-  constexpr int BD = 32;
-  constexpr int qk_per_thread = D / BD;
-  constexpr int v_per_thread = V / BD;
-  int inner_k_stride = BN * int(k_seq_stride);
-  int inner_v_stride = BN * int(v_seq_stride);
+  constexpr uint BN = 32;
+  constexpr uint BD = 32;
+  constexpr uint qk_per_thread = D / BD;
+  constexpr uint v_per_thread = V / BD;
+  //uint inner_k_stride = BN * int(k_seq_stride);
+  //uint inner_v_stride = BN * int(v_seq_stride);
 
   typedef float U;
 
@@ -239,95 +180,96 @@ template <typename T, int D, int V = D>
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
-  const int q_batch_head_idx = tid.x;
+  // Cast int64_t arguments to uint for calculations
+  uint gqa_factor_u = static_cast<uint>(gqa_factor);
+  uint N_u = static_cast<uint>(N);
+  uint q_head_stride_u = static_cast<uint>(q_head_stride);
+  uint q_seq_stride_u = static_cast<uint>(q_seq_stride);
+  uint k_head_stride_u = static_cast<uint>(k_head_stride);
+  uint k_seq_stride_u = static_cast<uint>(k_seq_stride);
+  uint v_head_stride_u = static_cast<uint>(v_head_stride);
+  uint v_seq_stride_u = static_cast<uint>(v_seq_stride);
+  uint mask_head_stride_u = static_cast<uint>(mask_head_stride);
+  uint mask_kv_seq_stride_u = static_cast<uint>(mask_kv_seq_stride);
+  uint mask_q_seq_stride_u = static_cast<uint>(mask_q_seq_stride);
+  uint inner_k_stride = BN * k_seq_stride_u;
+  uint inner_v_stride = BN * v_seq_stride_u;
+
+  // Adjust positions
+  const int head_idx = tid.x;
   const int q_seq_idx = tid.y;
-  const int kv_head_idx = q_batch_head_idx / gqa_factor;
-  const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
-  bool query_transposed = (query_transposed_val != 0);
-  bool has_mask = (has_mask_val != 0);
-  bool do_causal = (do_causal_val != 0);
-  bool bool_mask = (bool_mask_val != 0);
-  bool float_mask = (float_mask_val != 0);
-  bool has_sinks = (has_sinks_val != 0);
-  
-  const int q_offset =
-      query_transposed ? tpg.x * q_seq_idx + q_batch_head_idx : o_offset;
-  queries += q_offset * D + simd_lid * qk_per_thread;
-  keys += kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+  const int kv_head_idx = head_idx / gqa_factor_u;
+  const int Q = tpg.y;
+  const int group_offset = head_idx * Q + q_seq_idx;
+  const int o_offset = group_offset;
+  queries += head_idx * q_head_stride_u + q_seq_idx * q_seq_stride_u +
       simd_lid * qk_per_thread;
-  values += kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+  keys += kv_head_idx * k_head_stride_u + simd_gid * k_seq_stride_u +
+      simd_lid * qk_per_thread;
+  values += kv_head_idx * v_head_stride_u + simd_gid * v_seq_stride_u +
       simd_lid * v_per_thread;
-  if (bool_mask) {
-    bmask += q_batch_head_idx * mask_head_stride +
-        simd_gid * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
-  }
-  if (float_mask) {
-    fmask += q_batch_head_idx * mask_head_stride +
-        simd_gid * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+  bool has_mask = (has_mask_val != 0);
+  if (has_mask) {
+    mask += head_idx * mask_head_stride_u + simd_gid * mask_kv_seq_stride_u +
+        q_seq_idx * mask_q_seq_stride_u;
   }
 
   out += o_offset * V + simd_gid * v_per_thread;
 
+  // Reinterpret scale_bits as float
   float scale = as_type<float>(scale_bits);
-  for (int i = 0; i < qk_per_thread; i++) {
-    q[i] = static_cast<U>(scale) * queries[i];
+
+  // Read the query and 0 the output accumulator
+  for (uint i = 0; i < qk_per_thread; i++) {
+    q[i] = scale * static_cast<U>(queries[i]);
   }
-  for (int i = 0; i < v_per_thread; i++) {
+  for (uint i = 0; i < v_per_thread; i++) {
     o[i] = 0;
   }
 
-  U max_score = Limits<U>::finite_min;
+  U max_score = -INFINITY;
   U sum_exp_score = 0;
-  if (has_sinks && simd_gid == 0) {
-    max_score = static_cast<U>(sinks[q_batch_head_idx % num_q_heads]);
-    sum_exp_score = 1;
-  }
 
-  for (int i = simd_gid; i < N; i += BN) {
-    bool use_key = true;
-    if (do_causal) {
-      use_key = i <= (N - int(tpg.y) + int(q_seq_idx));
-    } else if (bool_mask) {
-      use_key = bmask[0];
-    } else if (float_mask) {
-      use_key = (fmask[0] >= Limits<T>::finite_min);
-    }
-    if (use_key) {
-      for (int j = 0; j < qk_per_thread; j++) {
-        k[j] = keys[j];
+  // For each key
+  for (uint i = simd_gid; i < N_u; i += BN) {
+    if (!has_mask || mask[0]) {
+      // Read the key
+      for (uint j = 0; j < qk_per_thread; j++) {
+        k[j] = static_cast<U>(keys[j]);
       }
 
+      // Compute the i-th score
       U score = 0;
-      for (int j = 0; j < qk_per_thread; j++) {
+      for (uint j = 0; j < qk_per_thread; j++) {
         score += q[j] * k[j];
       }
       score = simd_sum(score);
-      if (float_mask) {
-        score += static_cast<U>(fmask[0]);
-      }
 
+      // Update the accumulators
       U new_max = max(max_score, score);
-      U factor = fast::exp(max_score - new_max);
-      U exp_score = fast::exp(score - new_max);
+      U factor = metal::fast::exp(max_score - new_max);
+      U exp_score = metal::fast::exp(score - new_max);
 
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * values[j];
+      // Update the output accumulator
+      for (uint j = 0; j < v_per_thread; j++) {
+        o[j] = o[j] * factor + exp_score * static_cast<U>(values[j]);
       }
     }
 
+    // Move the pointers to the next kv
     keys += inner_k_stride;
     values += inner_v_stride;
-    if (bool_mask) {
-      bmask += BN * mask_kv_seq_stride;
-    }
-    if (float_mask) {
-      fmask += BN * mask_kv_seq_stride;
+    if (has_mask) {
+      mask += BN * mask_kv_seq_stride;
     }
   }
 
+  // Each thread has a partial part of the output so we need to combine them.
+
+  // First let's communicate the max and sum_exp
   if (simd_lid == 0) {
     max_scores[simd_gid] = max_score;
     sum_exp_scores[simd_gid] = sum_exp_score;
@@ -335,41 +277,61 @@ template <typename T, int D, int V = D>
   threadgroup_barrier(mem_flags::mem_threadgroup);
   max_score = max_scores[simd_lid];
   U new_max = simd_max(max_score);
-  U factor = fast::exp(max_score - new_max);
+  U factor = metal::fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
-  for (int i = 0; i < v_per_thread; i++) {
+  // Now we need to aggregate all the outputs
+  for (uint i = 0; i < v_per_thread; i++) {
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
-    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    const U safe_sum = (sum_exp_score == 0 ? 1e-6f : sum_exp_score);
+    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor) / safe_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
+  // And write the output
   if (simd_lid == 0) {
-    for (int i = 0; i < v_per_thread; i++) {
+    for (uint i = 0; i < v_per_thread; i++) {
       out[i] = static_cast<T>(o[i]);
     }
   }
 }
 
-#define instantiate_sdpa_vector(type, qk_dim, value_dim)       \
-  instantiate_kernel(                                          \
-      "sdpa_vector_" #type "_" #qk_dim "_" #value_dim,         \
-      sdpa_vector,                                             \
-      type,                                                    \
-      qk_dim,                                                  \
-      value_dim)
+#define INSTANTIATE_SDPA_VECTOR(DTYPE, QK_DIM, VALUE_DIM)   \
+  template [[host_name("sdpa_vector_" #DTYPE "_" #QK_DIM    \
+                       "_" #VALUE_DIM)]] kernel void        \
+  sdpa_vector<DTYPE, QK_DIM, VALUE_DIM>(                    \
+      const device DTYPE* queries [[buffer(0)]],            \
+      const device DTYPE* keys [[buffer(1)]],               \
+      const device DTYPE* values [[buffer(2)]],             \
+      device DTYPE* out [[buffer(3)]],                      \
+      constant uint& gqa_factor [[buffer(4)]],        \
+      constant uint& N [[buffer(5)]],                 \
+      constant uint& q_head_stride [[buffer(6)]], \
+      constant uint& k_head_stride [[buffer(7)]], \
+      constant uint& v_head_stride [[buffer(8)]], \
+      constant uint& q_seq_stride [[buffer(9)]],  \
+      constant uint& k_seq_stride [[buffer(10)]],  \
+      constant uint& v_seq_stride [[buffer(11)]],  \
+      constant uint& scale_bits [[buffer(12)]],            \
+      const device bool* mask [[buffer(13)]],                \
+      constant uint& mask_head_stride [[buffer(14)]],    \
+      constant uint& mask_kv_seq_stride [[buffer(15)]],    \
+      constant uint& mask_q_seq_stride [[buffer(16)]],    \
+      constant uint& has_mask_val [[buffer(17)]],         \
+      uint3 tid [[threadgroup_position_in_grid]],           \
+      uint3 tpg [[threadgroups_per_grid]],                  \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],     \
+      uint simd_lid [[thread_index_in_simdgroup]]);
 
-#define instantiate_sdpa_vector_heads(type)      \
-  instantiate_sdpa_vector(type, 64, 64)          \
-  instantiate_sdpa_vector(type, 96, 96)          \
-  instantiate_sdpa_vector(type, 128, 128)        \
-  instantiate_sdpa_vector(type, 256, 256)
+#define INSTANTIATE_SDPA_VECTOR_HEADS(DTYPE)        \
+  INSTANTIATE_SDPA_VECTOR(DTYPE, 64, 64);           \
+  INSTANTIATE_SDPA_VECTOR(DTYPE, 96, 96);           \
+  INSTANTIATE_SDPA_VECTOR(DTYPE, 128, 128);
 
-instantiate_sdpa_vector_heads(float)
-instantiate_sdpa_vector_heads(bfloat16_t)
-instantiate_sdpa_vector_heads(float16_t)
+INSTANTIATE_SDPA_VECTOR_HEADS(float);
+INSTANTIATE_SDPA_VECTOR_HEADS(half);
+INSTANTIATE_SDPA_VECTOR_HEADS(bfloat);
 )";
 }
 
@@ -1420,34 +1382,27 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           throw std::runtime_error("Failed to get SDPA shader library");
         }
 
-        // Determine kernel name based on dtype and head_dim
+        // Determine kernel name based on dtype and head_dim (PyTorch format)
         std::string type_name;
         if (dtype == static_cast<int32_t>(SupportedDTypes::FLOAT32)) {
           type_name = "float";
         } else if (dtype == static_cast<int32_t>(SupportedDTypes::BFLOAT16)) {
-          type_name = "bfloat16_t";
-        } else {
+          type_name = "bfloat";
+        } else if (dtype == static_cast<int32_t>(SupportedDTypes::FLOAT16)) {
+          type_name = "half";
+          } else {
           ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Unsupported dtype for Metal kernel");
           throw std::runtime_error("Unsupported dtype for Metal SDPA kernel");
         }
 
-        // Select head_dim - must match exactly one of the supported sizes (64, 96, 128, 256)
+        // Select head_dim - must match exactly one of the supported sizes (64, 96, 128)
         int64_t head_dim = headSize;
-        int64_t kernel_head_dim = head_dim;
-        if (head_dim == 64) {
-          kernel_head_dim = 64;
-        } else if (head_dim == 96) {
-          kernel_head_dim = 96;
-        } else if (head_dim == 128) {
-          kernel_head_dim = 128;
-        } else if (head_dim == 256) {
-          kernel_head_dim = 256;
-        } else {
-          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Unsupported head_dim %lld (must be 64, 96, 128, or 256)", head_dim);
-          throw std::runtime_error("Unsupported head_dim for Metal SDPA kernel - must be exactly 64, 96, 128, or 256");
+        if (head_dim != 64 && head_dim != 96 && head_dim != 128) {
+          ET_LOG(Error, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Unsupported head_dim %lld (must be 64, 96, or 128)", head_dim);
+          throw std::runtime_error("Unsupported head_dim for Metal SDPA kernel - must be exactly 64, 96, or 128");
         }
 
-        std::string kernel_name = "sdpa_vector_" + type_name + "_" + std::to_string(kernel_head_dim) + "_" + std::to_string(kernel_head_dim);
+        std::string kernel_name = "sdpa_vector_" + type_name + "_" + std::to_string(head_dim) + "_" + std::to_string(head_dim);
         ET_LOG(Debug, "aoti_torch_mps__scaled_dot_product_attention_math_for_mps: Using kernel: %s", kernel_name.c_str());
 
         // Get kernel function
@@ -1487,35 +1442,37 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
 
         auto* out_tensor = reinterpret_cast<Tensor*>(out_tensor_handle);
 
-        // Prepare kernel arguments
-        int gqa_factor = static_cast<int>(num_heads / key_tensor->sizes()[1]);
-        int N = static_cast<int>(kvSeqLength);
-        size_t k_head_stride = key_tensor->sizes()[1] == 1 ? key_tensor->strides()[0] : key_tensor->strides()[1];
-        size_t k_seq_stride = key_tensor->strides()[2];
-        size_t v_head_stride = value_tensor->sizes()[1] == 1 ? value_tensor->strides()[0] : value_tensor->strides()[1];
-        size_t v_seq_stride = value_tensor->strides()[2];
+        // Prepare kernel arguments (PyTorch format)
+        uint gqa_factor = static_cast<uint>(num_heads / key_tensor->sizes()[1]);
+        uint N = static_cast<uint>(kvSeqLength);
+        
+        // Get strides for Q, K, V
+        uint q_head_stride = static_cast<uint>(query_tensor->strides()[1]);
+        uint q_seq_stride = static_cast<uint>(query_tensor->strides()[2]);
+        uint k_head_stride = static_cast<uint>(key_tensor->sizes()[1] == 1 ? key_tensor->strides()[0] : key_tensor->strides()[1]);
+        uint k_seq_stride = static_cast<uint>(key_tensor->strides()[2]);
+        uint v_head_stride = static_cast<uint>(value_tensor->sizes()[1] == 1 ? value_tensor->strides()[0] : value_tensor->strides()[1]);
+        uint v_seq_stride = static_cast<uint>(value_tensor->strides()[2]);
 
         bool has_mask_val = (attn_mask && *attn_mask);
-        bool query_transposed_val = query_is_transposed_last2 || query_is_transposed_internal;
-        bool do_causal_val = (is_causal != 0);
-        bool bool_mask_val = false;
-        bool float_mask_val = false;
+        
+        // Calculate mask strides if mask is present
+        uint mask_head_stride = 0;
+        uint mask_kv_seq_stride = 0;
+        uint mask_q_seq_stride = 0;
         if (has_mask_val) {
-          auto* mask_tensor = reinterpret_cast<Tensor*>(*attn_mask);
-          bool_mask_val = (mask_tensor->scalar_type() == executorch::aten::ScalarType::Bool);
-          float_mask_val = !bool_mask_val;
+            auto* mask_tensor = reinterpret_cast<Tensor*>(*attn_mask);
+          int nd = mask_tensor->dim();
+          mask_kv_seq_stride = (nd >= 1 && mask_tensor->sizes()[nd - 1] > 1) ? static_cast<uint>(mask_tensor->strides()[nd - 1]) : 0;
+          mask_q_seq_stride = (nd >= 2 && mask_tensor->sizes()[nd - 2] > 1) ? static_cast<uint>(mask_tensor->strides()[nd - 2]) : 0;
+          mask_head_stride = (nd >= 3 && mask_tensor->sizes()[nd - 3] > 1) ? static_cast<uint>(mask_tensor->strides()[nd - 3]) : 0;
         }
-
-        // Note: Function constants are not directly supported in current ETMetalShaderLibrary
-        // For now, we'll use a simplified kernel variant. In a full implementation,
-        // we would need to extend ETMetalShaderLibrary to support function constants.
-        // This is a minimal implementation that works for the common case.
 
         // Execute kernel
         kernel_func->runCommandBlock([&]() {
           kernel_func->startEncoding();
           
-          // Set buffer arguments
+          // Set buffer arguments (0-3: Q, K, V, out)
           kernel_func->setArg(0, *query_tensor);
           kernel_func->setArg(1, *key_tensor);
           kernel_func->setArg(2, *value_tensor);
@@ -1524,58 +1481,40 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           // Set scalar arguments
           kernel_func->setArg(4, static_cast<int64_t>(gqa_factor));
           kernel_func->setArg(5, static_cast<int64_t>(N));
-          kernel_func->setArg(6, static_cast<int64_t>(k_head_stride));
-          kernel_func->setArg(7, static_cast<int64_t>(k_seq_stride));
-          kernel_func->setArg(8, static_cast<int64_t>(v_head_stride));
-          kernel_func->setArg(9, static_cast<int64_t>(v_seq_stride));
           
-          // Pass scale as int64_t (bitcast - kernel will reinterpret as float)
-          // Note: This is a workaround since setArg only supports int64_t
-          // In a full implementation, we'd extend ETMetalKernelFunction to support float arguments
+          // Set head strides (buffers 6-8)
+          kernel_func->setArg(6, static_cast<int64_t>(q_head_stride));
+          kernel_func->setArg(7, static_cast<int64_t>(k_head_stride));
+          kernel_func->setArg(8, static_cast<int64_t>(v_head_stride));
+          
+          // Set seq strides (buffers 9-11)
+          kernel_func->setArg(9, static_cast<int64_t>(q_seq_stride));
+          kernel_func->setArg(10, static_cast<int64_t>(k_seq_stride));
+          kernel_func->setArg(11, static_cast<int64_t>(v_seq_stride));
+          
+          // Pass scale as float (bitcast to int32_t then int64_t)
           float scale_float = static_cast<float>(scale_factor);
           int32_t scale_bits = *reinterpret_cast<const int32_t*>(&scale_float);
-          kernel_func->setArg(10, static_cast<int64_t>(scale_bits));
+          kernel_func->setArg(12, static_cast<int64_t>(scale_bits));
           
-          // Set function constant values as regular arguments
-          kernel_func->setArg(11, static_cast<int64_t>(has_mask_val ? 1 : 0));
-          kernel_func->setArg(12, static_cast<int64_t>(query_transposed_val ? 1 : 0));
-          kernel_func->setArg(13, static_cast<int64_t>(do_causal_val ? 1 : 0));
-          kernel_func->setArg(14, static_cast<int64_t>(bool_mask_val ? 1 : 0));
-          kernel_func->setArg(15, static_cast<int64_t>(float_mask_val ? 1 : 0));
-          kernel_func->setArg(16, static_cast<int64_t>(0)); // has_sinks (not supported yet)
-          
-          // Set mask buffers (use query as dummy if no mask - won't be accessed)
+          // Set mask buffer (buffer 13)
           if (has_mask_val) {
             auto* mask_tensor = reinterpret_cast<Tensor*>(*attn_mask);
-            if (bool_mask_val) {
-              kernel_func->setArg(17, *mask_tensor);
-              // Set dummy for float mask
-              kernel_func->setArg(18, *query_tensor);
-            } else {
-              // Set dummy for bool mask
-              kernel_func->setArg(17, *query_tensor);
-              kernel_func->setArg(18, *mask_tensor);
-            }
-            int32_t kv_seq_stride = mask_tensor->sizes()[3] > 1 ? mask_tensor->strides()[3] : 0;
-            int32_t q_seq_stride = mask_tensor->sizes()[2] > 1 ? mask_tensor->strides()[2] : 0;
-            int32_t head_stride = mask_tensor->sizes()[1] > 1 ? mask_tensor->strides()[1] : (mask_tensor->sizes()[0] > 1 ? mask_tensor->strides()[0] : 0);
-            kernel_func->setArg(19, static_cast<int64_t>(kv_seq_stride));
-            kernel_func->setArg(20, static_cast<int64_t>(q_seq_stride));
-            kernel_func->setArg(21, static_cast<int64_t>(head_stride));
+            kernel_func->setArg(13, *mask_tensor);
           } else {
-            // Set dummy buffers for mask (won't be accessed)
-            kernel_func->setArg(17, *query_tensor);
-            kernel_func->setArg(18, *query_tensor);
-            kernel_func->setArg(19, static_cast<int64_t>(0));
-            kernel_func->setArg(20, static_cast<int64_t>(0));
-            kernel_func->setArg(21, static_cast<int64_t>(0));
+            // Dummy buffer if no mask (won't be accessed)
+            kernel_func->setArg(13, *query_tensor);
           }
           
-          // Set dummy for sinks (not supported yet)
-          kernel_func->setArg(22, *query_tensor);
-          kernel_func->setArg(23, static_cast<int64_t>(0));
+          // Set mask strides (buffers 14-16)
+          kernel_func->setArg(14, static_cast<int64_t>(mask_head_stride));
+          kernel_func->setArg(15, static_cast<int64_t>(mask_kv_seq_stride));
+          kernel_func->setArg(16, static_cast<int64_t>(mask_q_seq_stride));
           
-          // Dispatch
+          // Set has_mask (buffer 17)
+          kernel_func->setArg(17, static_cast<int64_t>(has_mask_val ? 1 : 0));
+          
+          // Dispatch (PyTorch uses grid: [batch*heads, qSize, 1], group: [1024, 1, 1])
           uint64_t grid_dims[3] = {static_cast<uint64_t>(batchSize * num_heads), static_cast<uint64_t>(qSize), 1};
           uint64_t group_dims[3] = {1024, 1, 1};
           kernel_func->dispatchArrayWithGroupSize(grid_dims, 3, group_dims, 3);
@@ -1587,7 +1526,7 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
 
         // Create attention weights tensor handle (zero-filled)
         std::memset(attn_contents_ptr, 0, attn_size_bytes);
-        
+
         AOTITensorHandle attn_tensor_handle = nullptr;
         AOTITorchError create_attn_result = aoti_torch_create_tensor_from_blob_v2(
             attn_contents_ptr,
