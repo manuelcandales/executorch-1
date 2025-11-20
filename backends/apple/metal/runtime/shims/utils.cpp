@@ -22,6 +22,7 @@ bool is_dtype_supported_in_et_metal(int32_t dtype) {
     case static_cast<int32_t>(SupportedDTypes::INT64):
     case static_cast<int32_t>(SupportedDTypes::FLOAT32):
     case static_cast<int32_t>(SupportedDTypes::BFLOAT16):
+    case static_cast<int32_t>(SupportedDTypes::FLOAT16):
       return true;
     default:
       return false;
@@ -40,7 +41,8 @@ AOTITorchError validate_dtype(int32_t dtype) {
       dtype,
       static_cast<int32_t>(SupportedDTypes::INT64),
       static_cast<int32_t>(SupportedDTypes::FLOAT32),
-      static_cast<int32_t>(SupportedDTypes::BFLOAT16));
+      static_cast<int32_t>(SupportedDTypes::BFLOAT16),
+      static_cast<int32_t>(SupportedDTypes::FLOAT16));
   return Error::InvalidArgument;
 }
 
