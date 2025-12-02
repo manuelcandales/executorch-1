@@ -121,6 +121,12 @@ target_link_libraries(
                         portable_ops_lib
 )
 
+# Add SDPA unit test
+add_executable(op_sdpa_test tests/op_sdpa_test.mm)
+target_link_libraries(
+  op_sdpa_test PUBLIC metal_backend extension_tensor
+)
+
 install(
   TARGETS metal_backend
   EXPORT ExecuTorchTargets
