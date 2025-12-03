@@ -138,7 +138,6 @@ typedef half float16_t;
 typedef bfloat bfloat16_t;
 
 // PyTorch's sdpa_vector kernel (one-pass variant)
-// Adapted to accept separate uint values instead of uint3 for ExecuTorch API compatibility
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector(
     const device T* queries [[buffer(0)]],
@@ -147,18 +146,12 @@ template <typename T, int D, int V = D>
     device T* out [[buffer(3)]],
     constant uint& gqa_factor [[buffer(4)]],
     constant uint& N [[buffer(5)]],
-    constant uint& q_head_stride [[buffer(6)]],
-    constant uint& k_head_stride [[buffer(7)]],
-    constant uint& v_head_stride [[buffer(8)]],
-    constant uint& q_seq_stride [[buffer(9)]],
-    constant uint& k_seq_stride [[buffer(10)]],
-    constant uint& v_seq_stride [[buffer(11)]],
-    constant uint& scale_bits [[buffer(12)]],
-    const device bool* mask [[buffer(13)]],
-    constant uint& mask_head_stride [[buffer(14)]],
-    constant uint& mask_kv_seq_stride [[buffer(15)]],
-    constant uint& mask_q_seq_stride [[buffer(16)]],
-    constant uint& has_mask_val [[buffer(17)]],
+    constant uint3& qkv_head_strides [[buffer(6)]],
+    constant uint3& qkv_seq_strides [[buffer(7)]],
+    constant float& scale [[buffer(8)]],
+    const device bool* mask [[buffer(9)]],
+    constant uint3& mask_strides [[buffer(10)]],
+    constant bool& has_mask [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -167,8 +160,17 @@ template <typename T, int D, int V = D>
   constexpr uint BD = 32;
   constexpr uint qk_per_thread = D / BD;
   constexpr uint v_per_thread = V / BD;
-  //uint inner_k_stride = BN * int(k_seq_stride);
-  //uint inner_v_stride = BN * int(v_seq_stride);
+  const uint q_head_stride = qkv_head_strides.x;
+  const uint q_seq_stride = qkv_seq_strides.x;
+  const uint k_head_stride = qkv_head_strides.y;
+  const uint k_seq_stride = qkv_seq_strides.y;
+  const uint v_head_stride = qkv_head_strides.z;
+  const uint v_seq_stride = qkv_seq_strides.z;
+  const uint mask_head_stride = mask_strides.x;
+  const uint mask_kv_seq_stride = mask_strides.y;
+  const uint mask_q_seq_stride = mask_strides.z;
+  uint inner_k_stride = BN * int(k_seq_stride);
+  uint inner_v_stride = BN * int(v_seq_stride);
 
   typedef float U;
 
@@ -180,44 +182,25 @@ template <typename T, int D, int V = D>
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
-  // Cast int64_t arguments to uint for calculations
-  uint gqa_factor_u = static_cast<uint>(gqa_factor);
-  uint N_u = static_cast<uint>(N);
-  uint q_head_stride_u = static_cast<uint>(q_head_stride);
-  uint q_seq_stride_u = static_cast<uint>(q_seq_stride);
-  uint k_head_stride_u = static_cast<uint>(k_head_stride);
-  uint k_seq_stride_u = static_cast<uint>(k_seq_stride);
-  uint v_head_stride_u = static_cast<uint>(v_head_stride);
-  uint v_seq_stride_u = static_cast<uint>(v_seq_stride);
-  uint mask_head_stride_u = static_cast<uint>(mask_head_stride);
-  uint mask_kv_seq_stride_u = static_cast<uint>(mask_kv_seq_stride);
-  uint mask_q_seq_stride_u = static_cast<uint>(mask_q_seq_stride);
-  uint inner_k_stride = BN * k_seq_stride_u;
-  uint inner_v_stride = BN * v_seq_stride_u;
-
   // Adjust positions
   const int head_idx = tid.x;
   const int q_seq_idx = tid.y;
-  const int kv_head_idx = head_idx / gqa_factor_u;
+  const int kv_head_idx = head_idx / gqa_factor;
   const int Q = tpg.y;
   const int group_offset = head_idx * Q + q_seq_idx;
   const int o_offset = group_offset;
-  queries += head_idx * q_head_stride_u + q_seq_idx * q_seq_stride_u +
+  queries += head_idx * q_head_stride + q_seq_idx * q_seq_stride +
       simd_lid * qk_per_thread;
-  keys += kv_head_idx * k_head_stride_u + simd_gid * k_seq_stride_u +
+  keys += kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
       simd_lid * qk_per_thread;
-  values += kv_head_idx * v_head_stride_u + simd_gid * v_seq_stride_u +
+  values += kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
       simd_lid * v_per_thread;
-  bool has_mask = (has_mask_val != 0);
   if (has_mask) {
-    mask += head_idx * mask_head_stride_u + simd_gid * mask_kv_seq_stride_u +
-        q_seq_idx * mask_q_seq_stride_u;
+    mask += head_idx * mask_head_stride + simd_gid * mask_kv_seq_stride +
+        q_seq_idx * mask_q_seq_stride;
   }
 
   out += o_offset * V + simd_gid * v_per_thread;
-
-  // Reinterpret scale_bits as float
-  float scale = as_type<float>(scale_bits);
 
   // Read the query and 0 the output accumulator
   for (uint i = 0; i < qk_per_thread; i++) {
@@ -231,7 +214,7 @@ template <typename T, int D, int V = D>
   U sum_exp_score = 0;
 
   // For each key
-  for (uint i = simd_gid; i < N_u; i += BN) {
+  for (uint i = simd_gid; i < N; i += BN) {
     if (!has_mask || mask[0]) {
       // Read the key
       for (uint j = 0; j < qk_per_thread; j++) {
@@ -307,18 +290,12 @@ template <typename T, int D, int V = D>
       device DTYPE* out [[buffer(3)]],                      \
       constant uint& gqa_factor [[buffer(4)]],        \
       constant uint& N [[buffer(5)]],                 \
-      constant uint& q_head_stride [[buffer(6)]], \
-      constant uint& k_head_stride [[buffer(7)]], \
-      constant uint& v_head_stride [[buffer(8)]], \
-      constant uint& q_seq_stride [[buffer(9)]],  \
-      constant uint& k_seq_stride [[buffer(10)]],  \
-      constant uint& v_seq_stride [[buffer(11)]],  \
-      constant uint& scale_bits [[buffer(12)]],            \
-      const device bool* mask [[buffer(13)]],                \
-      constant uint& mask_head_stride [[buffer(14)]],    \
-      constant uint& mask_kv_seq_stride [[buffer(15)]],    \
-      constant uint& mask_q_seq_stride [[buffer(16)]],    \
-      constant uint& has_mask_val [[buffer(17)]],         \
+      constant uint3& qkv_head_strides [[buffer(6)]], \
+      constant uint3& qkv_seq_strides [[buffer(7)]],  \
+      constant float& scale [[buffer(8)]],            \
+      const device bool* mask [[buffer(9)]],                \
+      constant uint3& mask_strides [[buffer(10)]],    \
+      constant bool& has_mask [[buffer(11)]],         \
       uint3 tid [[threadgroup_position_in_grid]],           \
       uint3 tpg [[threadgroups_per_grid]],                  \
       uint simd_gid [[simdgroup_index_in_threadgroup]],     \
@@ -1358,41 +1335,33 @@ AOTITorchError aoti_torch_mps__scaled_dot_product_attention_math_for_mps(
           kernel_func->setArg(2, *value_tensor);
           kernel_func->setArg(3, *out_tensor);
           
-          // Set scalar arguments
-          kernel_func->setArg(4, static_cast<int64_t>(gqa_factor));
-          kernel_func->setArg(5, static_cast<int64_t>(N));
+          // Set scalar arguments (uint values)
+          kernel_func->setArg(4, gqa_factor);
+          kernel_func->setArg(5, N);
           
-          // Set head strides (buffers 6-8)
-          kernel_func->setArg(6, static_cast<int64_t>(q_head_stride));
-          kernel_func->setArg(7, static_cast<int64_t>(k_head_stride));
-          kernel_func->setArg(8, static_cast<int64_t>(v_head_stride));
+          // Set uint3 for qkv_head_strides (buffer 6)
+          kernel_func->setArgUint3(6, q_head_stride, k_head_stride, v_head_stride);
           
-          // Set seq strides (buffers 9-11)
-          kernel_func->setArg(9, static_cast<int64_t>(q_seq_stride));
-          kernel_func->setArg(10, static_cast<int64_t>(k_seq_stride));
-          kernel_func->setArg(11, static_cast<int64_t>(v_seq_stride));
+          // Set uint3 for qkv_seq_strides (buffer 7)
+          kernel_func->setArgUint3(7, q_seq_stride, k_seq_stride, v_seq_stride);
           
-          // Pass scale as float (bitcast to int32_t then int64_t)
-          float scale_float = static_cast<float>(scale_factor);
-          int32_t scale_bits = *reinterpret_cast<const int32_t*>(&scale_float);
-          kernel_func->setArg(12, static_cast<int64_t>(scale_bits));
+          // Set scale as float (buffer 8)
+          kernel_func->setArg(8, static_cast<float>(scale_factor));
           
-          // Set mask buffer (buffer 13)
+          // Set mask buffer (buffer 9)
           if (has_mask_val) {
             auto* mask_tensor = reinterpret_cast<Tensor*>(*attn_mask);
-            kernel_func->setArg(13, *mask_tensor);
+            kernel_func->setArg(9, *mask_tensor);
           } else {
             // Dummy buffer if no mask (won't be accessed)
-            kernel_func->setArg(13, *query_tensor);
+            kernel_func->setArg(9, *query_tensor);
           }
           
-          // Set mask strides (buffers 14-16)
-          kernel_func->setArg(14, static_cast<int64_t>(mask_head_stride));
-          kernel_func->setArg(15, static_cast<int64_t>(mask_kv_seq_stride));
-          kernel_func->setArg(16, static_cast<int64_t>(mask_q_seq_stride));
+          // Set uint3 for mask_strides (buffer 10)
+          kernel_func->setArgUint3(10, mask_head_stride, mask_kv_seq_stride, mask_q_seq_stride);
           
-          // Set has_mask (buffer 17)
-          kernel_func->setArg(17, static_cast<int64_t>(has_mask_val ? 1 : 0));
+          // Set has_mask as bool (buffer 11)
+          kernel_func->setArg(11, has_mask_val);
           
           // Dispatch (PyTorch uses grid: [batch*heads, qSize, 1], group: [1024, 1, 1])
           uint64_t grid_dims[3] = {static_cast<uint64_t>(batchSize * num_heads), static_cast<uint64_t>(qSize), 1};

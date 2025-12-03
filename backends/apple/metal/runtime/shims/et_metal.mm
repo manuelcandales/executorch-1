@@ -377,6 +377,63 @@ void ETMetalKernelFunction::setArg(unsigned idx, int64_t val) {
     ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set int64_t value %lld at index %u", val, idx);
 }
 
+void ETMetalKernelFunction::setArg(unsigned idx, uint32_t val) {
+    if (!encoder_) {
+        ET_LOG(Error, "ETMetalKernelFunction::setArg: No active encoder");
+        return;
+    }
+
+    [encoder_ setBytes:&val length:sizeof(uint32_t) atIndex:idx];
+    ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set uint32_t value %u at index %u", val, idx);
+}
+
+void ETMetalKernelFunction::setArg(unsigned idx, float val) {
+    if (!encoder_) {
+        ET_LOG(Error, "ETMetalKernelFunction::setArg: No active encoder");
+        return;
+    }
+
+    [encoder_ setBytes:&val length:sizeof(float) atIndex:idx];
+    ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set float value %f at index %u", val, idx);
+}
+
+void ETMetalKernelFunction::setArg(unsigned idx, bool val) {
+    if (!encoder_) {
+        ET_LOG(Error, "ETMetalKernelFunction::setArg: No active encoder");
+        return;
+    }
+
+    [encoder_ setBytes:&val length:sizeof(bool) atIndex:idx];
+    ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set bool value %s at index %u", val ? "true" : "false", idx);
+}
+
+void ETMetalKernelFunction::setArg(unsigned idx, const void* data, size_t size) {
+    if (!encoder_) {
+        ET_LOG(Error, "ETMetalKernelFunction::setArg: No active encoder");
+        return;
+    }
+
+    [encoder_ setBytes:data length:size atIndex:idx];
+    ET_LOG(Debug, "ETMetalKernelFunction::setArg: Set bytes at index %u (size: %zu)", idx, size);
+}
+
+void ETMetalKernelFunction::setArgUint3(unsigned idx, uint32_t x, uint32_t y, uint32_t z) {
+    if (!encoder_) {
+        ET_LOG(Error, "ETMetalKernelFunction::setArgUint3: No active encoder");
+        return;
+    }
+
+    // Metal's uint3 is a packed struct of 3 uint32_t values
+    struct uint3 {
+        uint32_t x;
+        uint32_t y;
+        uint32_t z;
+    };
+    uint3 val = {x, y, z};
+    [encoder_ setBytes:&val length:sizeof(uint3) atIndex:idx];
+    ET_LOG(Debug, "ETMetalKernelFunction::setArgUint3: Set uint3{%u, %u, %u} at index %u", x, y, z, idx);
+}
+
 void ETMetalKernelFunction::dispatchSingle(uint64_t length) {
     if (!encoder_) {
         ET_LOG(Error, "ETMetalKernelFunction::dispatchSingle: No active encoder");
